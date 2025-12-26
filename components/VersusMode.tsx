@@ -17,6 +17,8 @@ import { soundPlayer } from '../lib/sound-utils'
 
 type VersusState = 'menu' | 'creating' | 'joining' | 'waiting' | 'playing' | 'finished'
 
+const ROOM_STORAGE_KEY = 'vocab-kai-versus-room'
+
 export default function VersusMode(props: {
   currentUserId: string
   currentUserName: string
@@ -28,9 +30,49 @@ export default function VersusMode(props: {
   const [room, setRoom] = useState<VersusRoom | null>(null)
   const [joinCode, setJoinCode] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [isRejoining, setIsRejoining] = useState(false)
 
   const channelRef = useRef<RealtimeChannel | null>(null)
   const turnTimerRef = useRef<NodeJS.Timeout | null>(null)
+
+  // Attempt to rejoin room on mount
+  useEffect(() => {
+    async function attemptRejoin() {
+      const savedRoomId = localStorage.getItem(ROOM_STORAGE_KEY)
+      if (!savedRoomId) return
+
+      try {
+        setIsRejoining(true)
+        const roomData = await getVersusRoom(savedRoomId)
+
+        if (roomData && roomData.status !== 'finished') {
+          // Verify user is part of this room
+          if (roomData.playerAId === currentUserId || roomData.playerBId === currentUserId) {
+            setRoom(roomData)
+
+            if (roomData.status === 'waiting') {
+              setState('waiting')
+            } else if (roomData.status === 'active') {
+              setState('playing')
+            }
+          } else {
+            // User not part of room, clear storage
+            localStorage.removeItem(ROOM_STORAGE_KEY)
+          }
+        } else {
+          // Room finished or doesn't exist, clear storage
+          localStorage.removeItem(ROOM_STORAGE_KEY)
+        }
+      } catch (err) {
+        console.error('Failed to rejoin room:', err)
+        localStorage.removeItem(ROOM_STORAGE_KEY)
+      } finally {
+        setIsRejoining(false)
+      }
+    }
+
+    attemptRejoin()
+  }, [currentUserId])
 
   // Cleanup on unmount
   useEffect(() => {
@@ -54,8 +96,12 @@ export default function VersusMode(props: {
       // Update state based on room status
       if (updatedRoom.status === 'active' && state === 'waiting') {
         setState('playing')
-      } else if (updatedRoom.status === 'finished' && state === 'playing') {
-        setState('finished')
+      } else if (updatedRoom.status === 'finished') {
+        // Clear saved room when game finishes
+        localStorage.removeItem(ROOM_STORAGE_KEY)
+        if (state === 'playing') {
+          setState('finished')
+        }
       }
     })
 
@@ -65,7 +111,7 @@ export default function VersusMode(props: {
       channel.unsubscribe()
       channelRef.current = null
     }
-  }, [room?.id])
+  }, [room?.id, state])
 
   // Timer for current turn
   useEffect(() => {
@@ -110,6 +156,8 @@ export default function VersusMode(props: {
       if (roomData) {
         setRoom(roomData)
         setState('waiting')
+        // Save room ID to localStorage for rejoin capability
+        localStorage.setItem(ROOM_STORAGE_KEY, roomId)
       }
     } catch (err: any) {
       console.error('Error creating room:', err)
@@ -133,6 +181,8 @@ export default function VersusMode(props: {
 
       if (roomData) {
         setRoom(roomData)
+        // Save room ID to localStorage for rejoin capability
+        localStorage.setItem(ROOM_STORAGE_KEY, roomId)
 
         // Load words and start game
         await initializeGame(roomData)
@@ -192,10 +242,10 @@ export default function VersusMode(props: {
     const isPlayerA = currentUserId === room.playerAId
     const currentIndex = isPlayerA ? room.playerAIndex : room.playerBIndex
     const totalWords = isPlayerA ? room.playerAWords.length : room.playerBWords.length
+    const newIndex = currentIndex + 1
 
     if (correct) {
-      // Correct answer
-      const newIndex = currentIndex + 1
+      // Correct answer - stay on current turn
       const newRightCount = isPlayerA ? room.playerARightCount + 1 : room.playerBRightCount + 1
 
       if (newIndex >= totalWords) {
@@ -210,15 +260,23 @@ export default function VersusMode(props: {
         })
       }
     } else {
-      // Wrong answer - switch turns
+      // Wrong answer - increment index AND switch turns
       const newWrongCount = isPlayerA ? room.playerAWrongCount + 1 : room.playerBWrongCount + 1
       const nextTurn = isPlayerA ? room.playerBId! : room.playerAId
 
-      await updateVersusRoom(room.id, {
-        currentTurn: nextTurn,
-        turnStartTime: new Date().toISOString(),
-        ...(isPlayerA ? { playerAWrongCount: newWrongCount } : { playerBWrongCount: newWrongCount }),
-      })
+      if (newIndex >= totalWords) {
+        // Player finished all words (but got last one wrong)
+        await finishGame(isPlayerA)
+      } else {
+        // Move to next word and switch turns
+        await updateVersusRoom(room.id, {
+          currentTurn: nextTurn,
+          turnStartTime: new Date().toISOString(),
+          ...(isPlayerA
+            ? { playerAIndex: newIndex, playerAWrongCount: newWrongCount }
+            : { playerBIndex: newIndex, playerBWrongCount: newWrongCount }),
+        })
+      }
     }
   }
 
@@ -276,9 +334,20 @@ export default function VersusMode(props: {
     if (turnTimerRef.current) {
       clearInterval(turnTimerRef.current)
     }
+    // Clear saved room from localStorage
+    localStorage.removeItem(ROOM_STORAGE_KEY)
     setRoom(null)
     setState('menu')
     onExit()
+  }
+
+  // Show loading state while rejoining
+  if (isRejoining) {
+    return (
+      <div className="min-h-[60vh] flex items-center justify-center">
+        <div className="text-lg text-slate-300">Reconnecting to room...</div>
+      </div>
+    )
   }
 
   // Render different screens based on state
@@ -368,6 +437,14 @@ export default function VersusMode(props: {
     return (
       <div className="max-w-4xl mx-auto">
         <div className="grid gap-4">
+          {/* Room Code Header */}
+          <div className="text-center">
+            <div className="inline-block rounded-xl bg-slate-950/40 border border-slate-700 px-4 py-2">
+              <span className="text-xs text-slate-400 mr-2">Room Code:</span>
+              <span className="text-lg font-mono font-bold tracking-wider">{room.roomCode}</span>
+            </div>
+          </div>
+
           {/* Game Header */}
           <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
             <div className="grid grid-cols-2 gap-4">
