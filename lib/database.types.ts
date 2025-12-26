@@ -128,5 +128,11 @@ export interface Database {
         Returns: string
       }
     }
+    Views: {
+      [_ in never]: never
+    }
+    Enums: {
+      [_ in never]: never
+    }
   }
 }

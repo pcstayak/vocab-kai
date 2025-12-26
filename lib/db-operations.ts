@@ -49,11 +49,14 @@ export async function getAllUsers(): Promise<User[]> {
 }
 
 export async function createUser(name: string): Promise<string> {
-  const { data, error } = await supabase
-    .rpc('vocab_create_user_with_progress', { user_name: name })
+  // Type assertion needed due to Supabase RPC typing limitations
+  const { data, error } = await supabase.rpc(
+    'vocab_create_user_with_progress' as any,
+    { user_name: name } as any
+  )
 
   if (error) throw error
-  return data
+  return data as string
 }
 
 // ============ Config Operations ============
@@ -66,13 +69,13 @@ export async function getConfig(): Promise<AppConfig> {
     .single()
 
   if (error) throw error
-  return data.config_json as AppConfig
+  return (data as any).config_json as AppConfig
 }
 
 export async function updateConfig(config: AppConfig): Promise<void> {
-  const { error } = await supabase
+  const { error } = await (supabase as any)
     .from('vocab_app_config')
-    .update({ config_json: config as any })
+    .update({ config_json: config })
     .eq('id', CONFIG_ID)
 
   if (error) throw error
@@ -123,15 +126,18 @@ export async function createWord(
   hint: string,
   definition: string
 ): Promise<string> {
-  const { data, error } = await supabase
-    .rpc('vocab_create_word_for_all_users', {
+  // Type assertion needed due to Supabase RPC typing limitations
+  const { data, error } = await supabase.rpc(
+    'vocab_create_word_for_all_users' as any,
+    {
       word_text: word,
       hint_text: hint,
       definition_text: definition,
-    })
+    } as any
+  )
 
   if (error) throw error
-  return data
+  return data as string
 }
 
 export async function updateWord(
@@ -140,7 +146,7 @@ export async function updateWord(
   hint: string,
   definition: string
 ): Promise<void> {
-  const { error } = await supabase
+  const { error } = await (supabase as any)
     .from('vocab_words')
     .update({ word, hint, definition })
     .eq('id', wordId)
@@ -150,7 +156,7 @@ export async function updateWord(
 
 export async function deleteWord(wordId: string): Promise<void> {
   // Cascade delete will handle vocab_user_progress automatically
-  const { error } = await supabase
+  const { error } = await (supabase as any)
     .from('vocab_words')
     .delete()
     .eq('id', wordId)
@@ -173,7 +179,7 @@ export async function updateProgress(
     lastResult: 'right' | 'wrong'
   }
 ): Promise<void> {
-  const { error } = await supabase
+  const { error } = await (supabase as any)
     .from('vocab_user_progress')
     .update({
       level_id: progress.levelId,
@@ -195,7 +201,7 @@ export async function setWordLevel(
   wordId: string,
   levelId: number
 ): Promise<void> {
-  const { error } = await supabase
+  const { error } = await (supabase as any)
     .from('vocab_user_progress')
     .update({
       level_id: levelId,
