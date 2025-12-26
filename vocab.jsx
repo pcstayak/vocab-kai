@@ -1,0 +1,1579 @@
+/*
+Spaced Repetition Vocab Trainer — Single-file Next.js (App Router) page.
+
+✅ What you get:
+- 3 pages in one file (tabs): Practice, Words, Settings
+- Local persistence (localStorage) for words, progress, config
+- Configurable levels, promotion requirements, review intervals
+- Practice queue that repeats "wrong" items in-session
+- Scheduling that uses due dates (daily/weekly/monthly by default, configurable)
+- Import/Export JSON for backup
+
+⚠️ How to use on Vercel (Next.js + Tailwind):
+- Create a Next.js app (App Router)
+- Put this file at: app/page.tsx
+- Tailwind should already be configured (standard Next+Tailwind template)
+
+No server/database required. Works offline in browser.
+*/
+
+'use client'
+
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+
+// ---------------- Types ----------------
+
+type ISODateString = string
+
+type LevelConfig = {
+  id: number
+  name: string
+  // How many consecutive correct answers are required to promote OUT of this level
+  promoteAfterCorrect: number
+  // How long until the item is due again after a correct answer at this level
+  intervalDays: number
+}
+
+type AppConfig = {
+  levels: LevelConfig[]
+  // Optional: if true, wrong answers make the card immediately due again (today)
+  wrongMakesImmediatelyDue: boolean
+  // If true, a wrong answer resets the consecutive correct streak for the current level
+  wrongResetsStreak: boolean
+}
+
+type WordItem = {
+  id: string
+  word: string
+  hint: string
+  definition: string
+  createdAt: ISODateString
+  updatedAt: ISODateString
+
+  // Learning state
+  levelId: number // corresponds to LevelConfig.id
+  streakCorrect: number // consecutive correct in current level
+  totalRight: number
+  totalWrong: number
+  lastReviewedAt?: ISODateString
+  dueAt: ISODateString
+  // Last result: useful for quick visual
+  lastResult?: 'right' | 'wrong'
+}
+
+type AppData = {
+  version: number
+  config: AppConfig
+  words: WordItem[]
+}
+
+// ---------------- Defaults ----------------
+
+const STORAGE_KEY = 'srs_vocab_trainer_v1'
+
+const defaultConfig: AppConfig = {
+  levels: [
+    { id: 1, name: 'Level 1', promoteAfterCorrect: 3, intervalDays: 1 },
+    { id: 2, name: 'Level 2', promoteAfterCorrect: 2, intervalDays: 7 },
+    { id: 3, name: 'Level 3', promoteAfterCorrect: 1, intervalDays: 30 },
+  ],
+  wrongMakesImmediatelyDue: true,
+  wrongResetsStreak: true,
+}
+
+const defaultData: AppData = {
+  version: 1,
+  config: defaultConfig,
+  words: [],
+}
+
+// ---------------- Utilities ----------------
+
+function todayStartLocal(): Date {
+  const d = new Date()
+  d.setHours(0, 0, 0, 0)
+  return d
+}
+
+function addDays(date: Date, days: number): Date {
+  const d = new Date(date)
+  d.setDate(d.getDate() + days)
+  return d
+}
+
+function toISO(d: Date): ISODateString {
+  return d.toISOString()
+}
+
+function parseISO(s: string): Date {
+  return new Date(s)
+}
+
+function uuid(): string {
+  // RFC4122-ish, fine for local IDs
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
+}
+
+function clampInt(n: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, Math.trunc(n)))
+}
+
+function safeJsonParse<T>(s: string | null): T | null {
+  if (!s) return null
+  try {
+    return JSON.parse(s) as T
+  } catch {
+    return null
+  }
+}
+
+function sortByDueThenUpdated(a: WordItem, b: WordItem) {
+  const da = parseISO(a.dueAt).getTime()
+  const db = parseISO(b.dueAt).getTime()
+  if (da !== db) return da - db
+  return parseISO(b.updatedAt).getTime() - parseISO(a.updatedAt).getTime()
+}
+
+function isDue(item: WordItem, now = new Date()): boolean {
+  return parseISO(item.dueAt).getTime() <= now.getTime()
+}
+
+function formatShortDate(iso?: string): string {
+  if (!iso) return '—'
+  const d = parseISO(iso)
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: '2-digit' })
+}
+
+function formatShortDateTime(iso?: string): string {
+  if (!iso) return '—'
+  const d = parseISO(iso)
+  return d.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+// ---------------- Main Component ----------------
+
+type Tab = 'practice' | 'words' | 'settings'
+
+export default function Page() {
+  const [tab, setTab] = useState<Tab>('practice')
+
+  const [data, setData] = useState<AppData>(defaultData)
+  const [loaded, setLoaded] = useState(false)
+
+  // Practice state
+  const [practiceMode, setPracticeMode] = useState(false)
+  const [showHint, setShowHint] = useState(false)
+  const [showDef, setShowDef] = useState(false)
+  const [sessionWrongPool, setSessionWrongPool] = useState<string[]>([]) // word IDs to re-ask
+  const [sessionSeenCount, setSessionSeenCount] = useState(0)
+  const [sessionRightCount, setSessionRightCount] = useState(0)
+  const [sessionWrongCount, setSessionWrongCount] = useState(0)
+
+  // Current card id for practice
+  const [currentId, setCurrentId] = useState<string | null>(null)
+
+  // Words editor state
+  const [editId, setEditId] = useState<string | null>(null)
+  const [draftWord, setDraftWord] = useState('')
+  const [draftHint, setDraftHint] = useState('')
+  const [draftDef, setDraftDef] = useState('')
+  const [search, setSearch] = useState('')
+
+  // Settings state
+  const [configDraft, setConfigDraft] = useState<AppConfig>(defaultConfig)
+  const [importText, setImportText] = useState('')
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+
+  // ---------------- Load / Save ----------------
+
+  useEffect(() => {
+    const saved = safeJsonParse<AppData>(typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null)
+    if (saved && saved.version === 1 && saved.config && Array.isArray(saved.words)) {
+      // Basic normalization: ensure dueAt exists
+      const normalized: AppData = {
+        version: 1,
+        config: normalizeConfig(saved.config),
+        words: (saved.words || []).map((w) => normalizeWord(w, normalizeConfig(saved.config))),
+      }
+      setData(normalized)
+      setConfigDraft(normalized.config)
+    } else {
+      setData(defaultData)
+      setConfigDraft(defaultConfig)
+    }
+    setLoaded(true)
+  }, [])
+
+  useEffect(() => {
+    if (!loaded) return
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
+  }, [data, loaded])
+
+  // ---------------- Derived ----------------
+
+  const levelMap = useMemo(() => {
+    const m = new Map<number, LevelConfig>()
+    for (const lvl of data.config.levels) m.set(lvl.id, lvl)
+    return m
+  }, [data.config.levels])
+
+  const now = useMemo(() => new Date(), [tab, practiceMode, currentId, data.words.length])
+
+  const dueWords = useMemo(() => {
+    const list = data.words.filter((w) => isDue(w, now))
+    list.sort(sortByDueThenUpdated)
+    return list
+  }, [data.words, now])
+
+  const notDueCount = useMemo(() => data.words.length - dueWords.length, [data.words.length, dueWords.length])
+
+  const currentWord: WordItem | null = useMemo(() => {
+    if (!currentId) return null
+    return data.words.find((w) => w.id === currentId) ?? null
+  }, [currentId, data.words])
+
+  const filteredWords = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    if (!q) return [...data.words].sort((a, b) => a.word.localeCompare(b.word))
+    return data.words
+      .filter((w) =>
+        [w.word, w.hint, w.definition].some((s) => (s || '').toLowerCase().includes(q))
+      )
+      .sort((a, b) => a.word.localeCompare(b.word))
+  }, [data.words, search])
+
+  const stats = useMemo(() => {
+    const total = data.words.length
+    const due = dueWords.length
+    const maxLevelId = Math.max(...data.config.levels.map((l) => l.id))
+    const byLevel: Record<number, number> = {}
+    for (const lvl of data.config.levels) byLevel[lvl.id] = 0
+    for (const w of data.words) byLevel[w.levelId] = (byLevel[w.levelId] ?? 0) + 1
+
+    const mastered = data.words.filter((w) => w.levelId === maxLevelId).length
+    return { total, due, mastered, byLevel }
+  }, [data.words, dueWords.length, data.config.levels])
+
+  // ---------------- Practice Logic ----------------
+
+  useEffect(() => {
+    if (!practiceMode) return
+
+    // Ensure current card exists; if not, pick next.
+    if (!currentId) {
+      const next = pickNextCardId({
+        data,
+        dueWords,
+        sessionWrongPool,
+      })
+      setCurrentId(next)
+      setShowHint(false)
+      setShowDef(false)
+      return
+    }
+
+    // If current became deleted, move on
+    if (currentId && !data.words.some((w) => w.id === currentId)) {
+      const next = pickNextCardId({
+        data,
+        dueWords,
+        sessionWrongPool,
+      })
+      setCurrentId(next)
+      setShowHint(false)
+      setShowDef(false)
+    }
+  }, [practiceMode, currentId, data, dueWords, sessionWrongPool])
+
+  function startPractice() {
+    setPracticeMode(true)
+    setSessionWrongPool([])
+    setSessionSeenCount(0)
+    setSessionRightCount(0)
+    setSessionWrongCount(0)
+
+    const next = pickNextCardId({ data, dueWords, sessionWrongPool: [] })
+    setCurrentId(next)
+    setShowHint(false)
+    setShowDef(false)
+  }
+
+  function stopPractice() {
+    setPracticeMode(false)
+    setCurrentId(null)
+    setShowHint(false)
+    setShowDef(false)
+    setSessionWrongPool([])
+  }
+
+  function pickNextAndResetViews(nextId: string | null) {
+    setCurrentId(nextId)
+    setShowHint(false)
+    setShowDef(false)
+  }
+
+  function answer(right: boolean) {
+    if (!currentWord) return
+
+    const updated = applyAnswer({
+      word: currentWord,
+      right,
+      config: data.config,
+    })
+
+    // Update word list
+    setData((prev) => ({
+      ...prev,
+      words: prev.words.map((w) => (w.id === updated.id ? updated : w)),
+    }))
+
+    setSessionSeenCount((n) => n + 1)
+    if (right) setSessionRightCount((n) => n + 1)
+    else setSessionWrongCount((n) => n + 1)
+
+    // Wrong -> add to sessionWrongPool (re-ask in same session)
+    let nextWrongPool = sessionWrongPool
+    if (!right) {
+      if (!sessionWrongPool.includes(updated.id)) {
+        nextWrongPool = [...sessionWrongPool, updated.id]
+        setSessionWrongPool(nextWrongPool)
+      }
+    } else {
+      // If answered right and it was in the wrong pool, remove it (so it stops repeating)
+      if (sessionWrongPool.includes(updated.id)) {
+        nextWrongPool = sessionWrongPool.filter((id) => id !== updated.id)
+        setSessionWrongPool(nextWrongPool)
+      }
+    }
+
+    // Pick next
+    const next = pickNextCardId({
+      data: { ...data, words: data.words.map((w) => (w.id === updated.id ? updated : w)) },
+      dueWords,
+      sessionWrongPool: nextWrongPool,
+      // Avoid immediate repeat unless that's all we have
+      avoidId: updated.id,
+    })
+
+    pickNextAndResetViews(next)
+  }
+
+  // ---------------- Word CRUD ----------------
+
+  function resetDraft() {
+    setEditId(null)
+    setDraftWord('')
+    setDraftHint('')
+    setDraftDef('')
+  }
+
+  function beginEdit(w: WordItem) {
+    setEditId(w.id)
+    setDraftWord(w.word)
+    setDraftHint(w.hint)
+    setDraftDef(w.definition)
+  }
+
+  function saveDraft() {
+    const word = draftWord.trim()
+    const hint = draftHint.trim()
+    const definition = draftDef.trim()
+    if (!word) return
+
+    const nowIso = toISO(new Date())
+
+    if (editId) {
+      setData((prev) => ({
+        ...prev,
+        words: prev.words.map((w) =>
+          w.id === editId
+            ? {
+                ...w,
+                word,
+                hint,
+                definition,
+                updatedAt: nowIso,
+              }
+            : w
+        ),
+      }))
+    } else {
+      // New word starts at first level and is due now
+      const firstLevelId = prevSafeFirstLevelId(data.config)
+      const item: WordItem = {
+        id: uuid(),
+        word,
+        hint,
+        definition,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        levelId: firstLevelId,
+        streakCorrect: 0,
+        totalRight: 0,
+        totalWrong: 0,
+        dueAt: nowIso,
+      }
+      setData((prev) => ({
+        ...prev,
+        words: [...prev.words, normalizeWord(item, prev.config)],
+      }))
+    }
+
+    resetDraft()
+  }
+
+  function deleteWord(id: string) {
+    setData((prev) => ({
+      ...prev,
+      words: prev.words.filter((w) => w.id !== id),
+    }))
+    if (currentId === id) {
+      setCurrentId(null)
+    }
+    if (editId === id) resetDraft()
+    setSessionWrongPool((pool) => pool.filter((x) => x !== id))
+  }
+
+  function setLevel(id: string, levelId: number) {
+    const lvl = levelMap.get(levelId)
+    if (!lvl) return
+    const nowIso = toISO(new Date())
+    setData((prev) => ({
+      ...prev,
+      words: prev.words.map((w) =>
+        w.id === id
+          ? {
+              ...w,
+              levelId,
+              streakCorrect: 0,
+              updatedAt: nowIso,
+              // Make it due now when manually changed so you can practice it
+              dueAt: nowIso,
+            }
+          : w
+      ),
+    }))
+  }
+
+  // ---------------- Settings ----------------
+
+  function applySettings() {
+    const normalized = normalizeConfig(configDraft)
+    setData((prev) => {
+      const words = prev.words.map((w) => normalizeWord(w, normalized))
+      return { ...prev, config: normalized, words }
+    })
+    setConfigDraft(normalized)
+  }
+
+  function resetToDefaults() {
+    setConfigDraft(defaultConfig)
+  }
+
+  function exportJson() {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'srs_vocab_trainer_export.json'
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  function importJsonFromText() {
+    const parsed = safeJsonParse<AppData>(importText)
+    if (!parsed || parsed.version !== 1 || !parsed.config || !Array.isArray(parsed.words)) {
+      alert('Import failed: invalid JSON or wrong format.')
+      return
+    }
+    const cfg = normalizeConfig(parsed.config)
+    const words = parsed.words.map((w) => normalizeWord(w, cfg))
+    setData({ version: 1, config: cfg, words })
+    setConfigDraft(cfg)
+    setImportText('')
+  }
+
+  async function importJsonFromFile(file: File) {
+    const text = await file.text()
+    setImportText(text)
+  }
+
+  function wipeAllData() {
+    if (!confirm('This will delete all words, progress and settings. Continue?')) return
+    setData(defaultData)
+    setConfigDraft(defaultConfig)
+    stopPractice()
+    resetDraft()
+    setSearch('')
+  }
+
+  // ---------------- UI ----------------
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100">
+      <div className="mx-auto max-w-5xl px-4 py-6">
+        <Header
+          tab={tab}
+          setTab={(t) => {
+            setTab(t)
+            // Leaving practice resets session visuals but keeps progress
+            if (t !== 'practice') {
+              setShowHint(false)
+              setShowDef(false)
+            }
+          }}
+          stats={stats}
+          dueNextHint={dueWords[0]?.dueAt}
+          practiceMode={practiceMode}
+          onStopPractice={stopPractice}
+        />
+
+        <main className="mt-6">
+          {tab === 'practice' && (
+            <PracticeTab
+              data={data}
+              dueWords={dueWords}
+              notDueCount={notDueCount}
+              practiceMode={practiceMode}
+              onStart={startPractice}
+              onStop={stopPractice}
+              currentWord={currentWord}
+              showHint={showHint}
+              showDef={showDef}
+              setShowHint={setShowHint}
+              setShowDef={setShowDef}
+              onAnswer={answer}
+              session={{
+                seen: sessionSeenCount,
+                right: sessionRightCount,
+                wrong: sessionWrongCount,
+                wrongPoolCount: sessionWrongPool.length,
+              }}
+              levelMap={levelMap}
+            />
+          )}
+
+          {tab === 'words' && (
+            <WordsTab
+              data={data}
+              levelMap={levelMap}
+              search={search}
+              setSearch={setSearch}
+              editId={editId}
+              draft={{ word: draftWord, hint: draftHint, def: draftDef }}
+              setDraft={{
+                setWord: setDraftWord,
+                setHint: setDraftHint,
+                setDef: setDraftDef,
+              }}
+              onBeginEdit={beginEdit}
+              onCancelEdit={resetDraft}
+              onSave={saveDraft}
+              onDelete={deleteWord}
+              onSetLevel={setLevel}
+              words={filteredWords}
+            />
+          )}
+
+          {tab === 'settings' && (
+            <SettingsTab
+              configDraft={configDraft}
+              setConfigDraft={setConfigDraft}
+              onApply={applySettings}
+              onResetDefaults={resetToDefaults}
+              exportJson={exportJson}
+              importText={importText}
+              setImportText={setImportText}
+              importJsonFromText={importJsonFromText}
+              importJsonFromFile={importJsonFromFile}
+              wipeAllData={wipeAllData}
+              fileInputRef={fileInputRef}
+            />
+          )}
+        </main>
+
+        <footer className="mt-10 border-t border-slate-800 pt-6 text-xs text-slate-400">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              Local-only storage (localStorage). Use Export/Import in Settings for backup.
+            </div>
+            <div>Version 1 • {new Date().getFullYear()}</div>
+          </div>
+        </footer>
+      </div>
+    </div>
+  )
+}
+
+// ---------------- Components ----------------
+
+function Header(props: {
+  tab: Tab
+  setTab: (t: Tab) => void
+  stats: { total: number; due: number; mastered: number; byLevel: Record<number, number> }
+  dueNextHint?: string
+  practiceMode: boolean
+  onStopPractice: () => void
+}) {
+  const { tab, setTab, stats, dueNextHint, practiceMode, onStopPractice } = props
+
+  return (
+    <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5 shadow-sm">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-3">
+          <div className="grid h-10 w-10 place-items-center rounded-xl bg-slate-800 text-slate-100">
+            <span className="text-lg font-semibold">SRS</span>
+          </div>
+          <div>
+            <div className="text-lg font-semibold leading-tight">Vocab Trainer</div>
+            <div className="text-sm text-slate-300">
+              Due today: <span className="font-medium text-slate-100">{stats.due}</span> • Total:{' '}
+              <span className="font-medium text-slate-100">{stats.total}</span> • Mastered:{' '}
+              <span className="font-medium text-slate-100">{stats.mastered}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-2 sm:items-end">
+          <div className="flex gap-2">
+            <TopTabButton active={tab === 'practice'} onClick={() => setTab('practice')}>
+              Practice
+            </TopTabButton>
+            <TopTabButton active={tab === 'words'} onClick={() => setTab('words')}>
+              Words
+            </TopTabButton>
+            <TopTabButton active={tab === 'settings'} onClick={() => setTab('settings')}>
+              Settings
+            </TopTabButton>
+          </div>
+          <div className="text-xs text-slate-400">
+            Next due: <span className="text-slate-200">{formatShortDateTime(dueNextHint)}</span>
+            {practiceMode ? (
+              <button
+                className="ml-3 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-slate-200 hover:bg-slate-900"
+                onClick={onStopPractice}
+              >
+                Stop session
+              </button>
+            ) : null}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
+        {Object.entries(stats.byLevel).map(([k, v]) => (
+          <div
+            key={k}
+            className="rounded-xl border border-slate-800 bg-slate-950/40 px-3 py-2 text-sm"
+          >
+            <div className="text-slate-400">Level {k}</div>
+            <div className="text-base font-semibold text-slate-100">{v}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function TopTabButton(props: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={props.onClick}
+      className={
+        'rounded-xl px-3 py-2 text-sm font-medium transition ' +
+        (props.active
+          ? 'bg-slate-100 text-slate-950'
+          : 'border border-slate-700 bg-slate-950/40 text-slate-200 hover:bg-slate-900')
+      }
+    >
+      {props.children}
+    </button>
+  )
+}
+
+function PracticeTab(props: {
+  data: AppData
+  dueWords: WordItem[]
+  notDueCount: number
+  practiceMode: boolean
+  onStart: () => void
+  onStop: () => void
+  currentWord: WordItem | null
+  showHint: boolean
+  showDef: boolean
+  setShowHint: (v: boolean) => void
+  setShowDef: (v: boolean) => void
+  onAnswer: (right: boolean) => void
+  session: { seen: number; right: number; wrong: number; wrongPoolCount: number }
+  levelMap: Map<number, LevelConfig>
+}) {
+  const {
+    dueWords,
+    notDueCount,
+    practiceMode,
+    onStart,
+    onStop,
+    currentWord,
+    showHint,
+    showDef,
+    setShowHint,
+    setShowDef,
+    onAnswer,
+    session,
+    levelMap,
+  } = props
+
+  const lvl = currentWord ? levelMap.get(currentWord.levelId) : undefined
+
+  return (
+    <div className="grid gap-4">
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+        {!practiceMode ? (
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <div className="text-lg font-semibold">Practice</div>
+              <div className="mt-1 text-sm text-slate-300">
+                Due now: <span className="font-medium text-slate-100">{dueWords.length}</span> • Not due:{' '}
+                <span className="font-medium text-slate-100">{notDueCount}</span>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={onStart}
+                className="rounded-xl bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-300"
+              >
+                Start session
+              </button>
+              <button
+                onClick={onStop}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
+              >
+                Reset
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <div className="text-lg font-semibold">Session</div>
+              <div className="mt-1 text-sm text-slate-300">
+                Seen: <span className="font-medium text-slate-100">{session.seen}</span> • Right:{' '}
+                <span className="font-medium text-slate-100">{session.right}</span> • Wrong:{' '}
+                <span className="font-medium text-slate-100">{session.wrong}</span> • Pending repeats:{' '}
+                <span className="font-medium text-slate-100">{session.wrongPoolCount}</span>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={onStop}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
+              >
+                Stop
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {practiceMode ? (
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+          {!currentWord ? (
+            <div className="flex flex-col items-center gap-3 py-10 text-center">
+              <div className="text-lg font-semibold">No cards due</div>
+              <div className="max-w-md text-sm text-slate-300">
+                You can add words in the Words tab, or wait until some cards become due.
+              </div>
+              <button
+                onClick={onStop}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
+              >
+                End session
+              </button>
+            </div>
+          ) : (
+            <div className="grid gap-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-sm text-slate-300">
+                  <Badge>{lvl?.name ?? `Level ${currentWord.levelId}`}</Badge>
+                  <Badge>
+                    Streak: {currentWord.streakCorrect}/{lvl?.promoteAfterCorrect ?? '—'}
+                  </Badge>
+                  <Badge>Due: {formatShortDate(currentWord.dueAt)}</Badge>
+                </div>
+                <div className="text-xs text-slate-400">
+                  Last: {currentWord.lastResult ? currentWord.lastResult.toUpperCase() : '—'} • Reviewed:{' '}
+                  {formatShortDateTime(currentWord.lastReviewedAt)}
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-6">
+                <div className="text-center">
+                  <div className="text-3xl font-bold tracking-tight sm:text-4xl">{currentWord.word}</div>
+                </div>
+
+                <div className="mt-6 grid gap-3">
+                  <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-sm font-semibold">Hint</div>
+                      <button
+                        className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-900"
+                        onClick={() => setShowHint((v) => !v)}
+                      >
+                        {showHint ? 'Hide' : 'Show hint'}
+                      </button>
+                    </div>
+                    <div className="mt-2 text-sm text-slate-200">
+                      {showHint ? (currentWord.hint || <span className="text-slate-500">(empty)</span>) : <span className="text-slate-500">Hidden</span>}
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-sm font-semibold">Definition</div>
+                      <button
+                        className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-900"
+                        onClick={() => setShowDef((v) => !v)}
+                      >
+                        {showDef ? 'Hide' : 'Reveal'}
+                      </button>
+                    </div>
+                    <div className="mt-2 text-sm text-slate-200">
+                      {showDef ? (currentWord.definition || <span className="text-slate-500">(empty)</span>) : <span className="text-slate-500">Hidden</span>}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-6 flex flex-col gap-2 sm:flex-row">
+                  <button
+                    className="w-full rounded-xl bg-rose-400 px-4 py-3 text-sm font-semibold text-slate-950 hover:bg-rose-300"
+                    onClick={() => onAnswer(false)}
+                  >
+                    Wrong
+                  </button>
+                  <button
+                    className="w-full rounded-xl bg-emerald-400 px-4 py-3 text-sm font-semibold text-slate-950 hover:bg-emerald-300"
+                    onClick={() => onAnswer(true)}
+                  >
+                    Right
+                  </button>
+                </div>
+
+                <div className="mt-3 text-center text-xs text-slate-400">
+                  Tip: you can answer without revealing hint/definition — this is manual self-grading.
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4 text-sm text-slate-300">
+                <div className="flex flex-wrap gap-3">
+                  <div>
+                    Total right: <span className="font-semibold text-slate-100">{currentWord.totalRight}</span>
+                  </div>
+                  <div>
+                    Total wrong: <span className="font-semibold text-slate-100">{currentWord.totalWrong}</span>
+                  </div>
+                  <div>
+                    Next due: <span className="font-semibold text-slate-100">{formatShortDateTime(currentWord.dueAt)}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+          <div className="grid gap-2">
+            <div className="text-sm text-slate-300">
+              How it works:
+              <ul className="ml-5 mt-1 list-disc text-slate-400">
+                <li>Only due cards show up in practice.</li>
+                <li>Wrong answers repeat again during the same session.</li>
+                <li>Correct answers increase streak; when streak hits the level threshold, the card promotes.</li>
+                <li>Intervals and thresholds are configurable in Settings.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Badge({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="inline-flex items-center rounded-full border border-slate-700 bg-slate-950/60 px-3 py-1 text-xs font-semibold text-slate-200">
+      {children}
+    </span>
+  )
+}
+
+function WordsTab(props: {
+  data: AppData
+  words: WordItem[]
+  levelMap: Map<number, LevelConfig>
+  search: string
+  setSearch: (v: string) => void
+  editId: string | null
+  draft: { word: string; hint: string; def: string }
+  setDraft: { setWord: (v: string) => void; setHint: (v: string) => void; setDef: (v: string) => void }
+  onBeginEdit: (w: WordItem) => void
+  onCancelEdit: () => void
+  onSave: () => void
+  onDelete: (id: string) => void
+  onSetLevel: (id: string, levelId: number) => void
+}) {
+  const {
+    data,
+    words,
+    levelMap,
+    search,
+    setSearch,
+    editId,
+    draft,
+    setDraft,
+    onBeginEdit,
+    onCancelEdit,
+    onSave,
+    onDelete,
+    onSetLevel,
+  } = props
+
+  const levels = data.config.levels
+
+  return (
+    <div className="grid gap-4">
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="text-lg font-semibold">Words</div>
+            <div className="mt-1 text-sm text-slate-300">
+              Manage your vocabulary list, edit content, and manually promote/demote.
+            </div>
+          </div>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search (word, hint, definition)"
+              className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 outline-none focus:border-slate-400 sm:w-80"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-5">
+        <div className="lg:col-span-2">
+          <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+            <div className="text-sm font-semibold">{editId ? 'Edit word' : 'Add word'}</div>
+            <div className="mt-3 grid gap-3">
+              <Field label="Word">
+                <input
+                  value={draft.word}
+                  onChange={(e) => setDraft.setWord(e.target.value)}
+                  placeholder="e.g., ephemeral"
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 outline-none focus:border-slate-400"
+                />
+              </Field>
+              <Field label="Hint">
+                <input
+                  value={draft.hint}
+                  onChange={(e) => setDraft.setHint(e.target.value)}
+                  placeholder="short clue"
+                  className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 outline-none focus:border-slate-400"
+                />
+              </Field>
+              <Field label="Definition">
+                <textarea
+                  value={draft.def}
+                  onChange={(e) => setDraft.setDef(e.target.value)}
+                  placeholder="meaning / translation / example"
+                  rows={4}
+                  className="w-full resize-none rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 outline-none focus:border-slate-400"
+                />
+              </Field>
+
+              <div className="flex gap-2">
+                <button
+                  onClick={onSave}
+                  className="w-full rounded-xl bg-emerald-400 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-300"
+                >
+                  {editId ? 'Save changes' : 'Add word'}
+                </button>
+                <button
+                  onClick={onCancelEdit}
+                  className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
+                >
+                  Clear
+                </button>
+              </div>
+
+              <div className="text-xs text-slate-400">
+                New words start at the first level and are due immediately.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="lg:col-span-3">
+          <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-semibold">Your list ({words.length})</div>
+              <div className="text-xs text-slate-400">Click a row to edit</div>
+            </div>
+
+            <div className="mt-4 overflow-hidden rounded-xl border border-slate-800">
+              <div className="max-h-[560px] overflow-auto">
+                <table className="min-w-full divide-y divide-slate-800 text-sm">
+                  <thead className="sticky top-0 bg-slate-950">
+                    <tr className="text-left text-xs text-slate-400">
+                      <th className="px-3 py-2">Word</th>
+                      <th className="px-3 py-2">Level</th>
+                      <th className="px-3 py-2">Due</th>
+                      <th className="px-3 py-2">Stats</th>
+                      <th className="px-3 py-2 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800 bg-slate-950/30">
+                    {words.map((w) => (
+                      <tr
+                        key={w.id}
+                        className={
+                          'cursor-pointer hover:bg-slate-900/40 ' +
+                          (editId === w.id ? 'bg-slate-900/60' : '')
+                        }
+                        onClick={() => onBeginEdit(w)}
+                      >
+                        <td className="px-3 py-2">
+                          <div className="font-semibold text-slate-100">{w.word}</div>
+                          <div className="text-xs text-slate-400 line-clamp-1">{w.hint || '—'}</div>
+                        </td>
+                        <td className="px-3 py-2">
+                          <select
+                            value={w.levelId}
+                            onChange={(e) => {
+                              e.stopPropagation()
+                              onSetLevel(w.id, Number(e.target.value))
+                            }}
+                            className="w-full rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-200 outline-none"
+                          >
+                            {levels.map((lvl) => (
+                              <option key={lvl.id} value={lvl.id}>
+                                {lvl.name}
+                              </option>
+                            ))}
+                          </select>
+                        </td>
+                        <td className="px-3 py-2 text-xs text-slate-300">{formatShortDate(w.dueAt)}</td>
+                        <td className="px-3 py-2 text-xs text-slate-300">
+                          <div>
+                            R:{' '}
+                            <span className="font-semibold text-slate-100">{w.totalRight}</span> / W:{' '}
+                            <span className="font-semibold text-slate-100">{w.totalWrong}</span>
+                          </div>
+                          <div className="text-slate-500">
+                            Streak: {w.streakCorrect}/{levelMap.get(w.levelId)?.promoteAfterCorrect ?? '—'}
+                          </div>
+                        </td>
+                        <td className="px-3 py-2 text-right">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              if (confirm(`Delete “${w.word}”?`)) onDelete(w.id)
+                            }}
+                            className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-xs font-semibold text-slate-200 hover:bg-slate-900"
+                          >
+                            Delete
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {words.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="px-3 py-10 text-center text-sm text-slate-400">
+                          No words yet. Add some on the left.
+                        </td>
+                      </tr>
+                    ) : null}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="mt-4 grid gap-2 text-xs text-slate-400">
+              <div>
+                Manual level changes reset the streak and make the card due immediately.
+              </div>
+              <div>
+                Editing a word does not change its scheduling.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="grid gap-1">
+      <span className="text-xs font-semibold text-slate-300">{label}</span>
+      {children}
+    </label>
+  )
+}
+
+function SettingsTab(props: {
+  configDraft: AppConfig
+  setConfigDraft: (c: AppConfig) => void
+  onApply: () => void
+  onResetDefaults: () => void
+  exportJson: () => void
+  importText: string
+  setImportText: (v: string) => void
+  importJsonFromText: () => void
+  importJsonFromFile: (file: File) => Promise<void>
+  wipeAllData: () => void
+  fileInputRef: React.RefObject<HTMLInputElement | null>
+}) {
+  const {
+    configDraft,
+    setConfigDraft,
+    onApply,
+    onResetDefaults,
+    exportJson,
+    importText,
+    setImportText,
+    importJsonFromText,
+    importJsonFromFile,
+    wipeAllData,
+    fileInputRef,
+  } = props
+
+  const levels = configDraft.levels
+
+  function updateLevel(idx: number, patch: Partial<LevelConfig>) {
+    const next = levels.map((l, i) => (i === idx ? { ...l, ...patch } : l))
+    // Ensure IDs stay unique and sorted
+    const normalized = normalizeConfig({ ...configDraft, levels: next })
+    setConfigDraft(normalized)
+  }
+
+  function addLevel() {
+    const maxId = Math.max(...levels.map((l) => l.id), 0)
+    const next: LevelConfig = {
+      id: maxId + 1,
+      name: `Level ${maxId + 1}`,
+      promoteAfterCorrect: 1,
+      intervalDays: 30,
+    }
+    const normalized = normalizeConfig({ ...configDraft, levels: [...levels, next] })
+    setConfigDraft(normalized)
+  }
+
+  function removeLevel(id: number) {
+    if (levels.length <= 1) return
+    if (!confirm(`Remove level ${id}? Cards at this level will be normalized when you apply settings.`)) return
+    const next = levels.filter((l) => l.id !== id)
+    const normalized = normalizeConfig({ ...configDraft, levels: next })
+    setConfigDraft(normalized)
+  }
+
+  return (
+    <div className="grid gap-4">
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="text-lg font-semibold">Settings</div>
+            <div className="mt-1 text-sm text-slate-300">
+              Configure levels, promotion thresholds, and review intervals.
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={onApply}
+              className="rounded-xl bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-white"
+            >
+              Apply
+            </button>
+            <button
+              onClick={onResetDefaults}
+              className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
+            >
+              Reset draft
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+        <div className="flex items-center justify-between">
+          <div className="text-sm font-semibold">Levels</div>
+          <button
+            onClick={addLevel}
+            className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-900"
+          >
+            Add level
+          </button>
+        </div>
+
+        <div className="mt-4 grid gap-3">
+          {levels
+            .slice()
+            .sort((a, b) => a.id - b.id)
+            .map((lvl, idx) => (
+              <div key={lvl.id} className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm font-semibold text-slate-100">ID {lvl.id}</div>
+                    <span className="text-xs text-slate-400">(max level is the highest ID)</span>
+                  </div>
+                  <button
+                    onClick={() => removeLevel(lvl.id)}
+                    className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-xs font-semibold text-slate-200 hover:bg-slate-900 disabled:opacity-50"
+                    disabled={levels.length <= 1}
+                  >
+                    Remove
+                  </button>
+                </div>
+
+                <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                  <Field label="Name">
+                    <input
+                      value={lvl.name}
+                      onChange={(e) => updateLevel(idx, { name: e.target.value })}
+                      className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-slate-400"
+                    />
+                  </Field>
+
+                  <Field label="Promote after correct (streak)">
+                    <input
+                      type="number"
+                      value={lvl.promoteAfterCorrect}
+                      min={1}
+                      onChange={(e) => updateLevel(idx, { promoteAfterCorrect: clampInt(Number(e.target.value), 1, 99) })}
+                      className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-slate-400"
+                    />
+                  </Field>
+
+                  <Field label="Interval days after correct">
+                    <input
+                      type="number"
+                      value={lvl.intervalDays}
+                      min={0}
+                      onChange={(e) => updateLevel(idx, { intervalDays: clampInt(Number(e.target.value), 0, 3650) })}
+                      className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-slate-400"
+                    />
+                  </Field>
+                </div>
+
+                <div className="mt-2 text-xs text-slate-400">
+                  When you answer right at this level, due date moves forward by interval days.
+                </div>
+              </div>
+            ))}
+        </div>
+
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+            <div className="text-sm font-semibold">Wrong answer behavior</div>
+            <div className="mt-3 grid gap-3">
+              <label className="flex items-center gap-2 text-sm text-slate-200">
+                <input
+                  type="checkbox"
+                  checked={configDraft.wrongMakesImmediatelyDue}
+                  onChange={(e) => setConfigDraft({ ...configDraft, wrongMakesImmediatelyDue: e.target.checked })}
+                  className="h-4 w-4"
+                />
+                Wrong makes the card due immediately
+              </label>
+              <label className="flex items-center gap-2 text-sm text-slate-200">
+                <input
+                  type="checkbox"
+                  checked={configDraft.wrongResetsStreak}
+                  onChange={(e) => setConfigDraft({ ...configDraft, wrongResetsStreak: e.target.checked })}
+                  className="h-4 w-4"
+                />
+                Wrong resets the streak for the current level
+              </label>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+            <div className="text-sm font-semibold">Storage and backups</div>
+            <div className="mt-2 text-sm text-slate-300">
+              This app uses <span className="font-semibold text-slate-100">localStorage</span>.
+              If you clear browser data or switch devices, you lose data unless you export.
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                onClick={exportJson}
+                className="rounded-xl bg-emerald-400 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-emerald-300"
+              >
+                Export JSON
+              </button>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-900"
+              >
+                Import file
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/json"
+                className="hidden"
+                onChange={async (e) => {
+                  const f = e.target.files?.[0]
+                  if (f) await importJsonFromFile(f)
+                }}
+              />
+            </div>
+
+            <div className="mt-3 grid gap-2">
+              <textarea
+                value={importText}
+                onChange={(e) => setImportText(e.target.value)}
+                placeholder="Paste exported JSON here (optional)"
+                rows={6}
+                className="w-full resize-none rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 outline-none focus:border-slate-400"
+              />
+              <button
+                onClick={importJsonFromText}
+                className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-white disabled:opacity-50"
+                disabled={!importText.trim()}
+              >
+                Import from text
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-rose-900/40 bg-rose-950/20 p-4">
+          <div className="text-sm font-semibold text-rose-200">Danger zone</div>
+          <div className="mt-2 text-sm text-rose-200/80">
+            Wipe everything (words, progress, settings).
+          </div>
+          <button
+            onClick={wipeAllData}
+            className="mt-3 rounded-xl bg-rose-400 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-rose-300"
+          >
+            Wipe all data
+          </button>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+        <div className="text-sm font-semibold">Notes about Vercel hosting</div>
+        <div className="mt-2 text-sm text-slate-300">
+          Vercel free tier hosting is stateless. Without an external DB, server-side persistence is not guaranteed.
+          This app uses browser storage, which is reliable for a single device.
+          If you want cross-device sync, the next step is adding Supabase (Auth + Postgres) and saving words/config per user.
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ---------------- Core Logic ----------------
+
+function normalizeConfig(cfg: AppConfig): AppConfig {
+  const levels = Array.isArray(cfg.levels) ? cfg.levels : defaultConfig.levels
+  const normalizedLevels = levels
+    .map((l, i) => ({
+      id: Number.isFinite(l.id) ? Math.trunc(l.id) : i + 1,
+      name: String(l.name ?? `Level ${i + 1}`),
+      promoteAfterCorrect: clampInt(Number(l.promoteAfterCorrect ?? 1), 1, 99),
+      intervalDays: clampInt(Number(l.intervalDays ?? 0), 0, 3650),
+    }))
+    .sort((a, b) => a.id - b.id)
+
+  // Ensure unique IDs
+  const unique: LevelConfig[] = []
+  const seen = new Set<number>()
+  for (const l of normalizedLevels) {
+    if (seen.has(l.id)) continue
+    seen.add(l.id)
+    unique.push(l)
+  }
+
+  // Ensure at least 1 level
+  const finalLevels = unique.length ? unique : defaultConfig.levels
+
+  return {
+    levels: finalLevels,
+    wrongMakesImmediatelyDue: !!cfg.wrongMakesImmediatelyDue,
+    wrongResetsStreak: !!cfg.wrongResetsStreak,
+  }
+}
+
+function normalizeWord(w: WordItem, cfg: AppConfig): WordItem {
+  const nowIso = toISO(new Date())
+  const firstLevelId = prevSafeFirstLevelId(cfg)
+  const maxLevelId = maxLevel(cfg)
+
+  const levelId = clampToExistingLevel(w.levelId ?? firstLevelId, cfg)
+  const dueAt = w.dueAt ? w.dueAt : nowIso
+
+  return {
+    id: String(w.id || uuid()),
+    word: String(w.word || '').trim(),
+    hint: String(w.hint || '').trim(),
+    definition: String(w.definition || '').trim(),
+    createdAt: w.createdAt || nowIso,
+    updatedAt: w.updatedAt || nowIso,
+
+    levelId,
+    streakCorrect: clampInt(Number(w.streakCorrect ?? 0), 0, 9999),
+    totalRight: clampInt(Number(w.totalRight ?? 0), 0, 999999),
+    totalWrong: clampInt(Number(w.totalWrong ?? 0), 0, 999999),
+    lastReviewedAt: w.lastReviewedAt,
+    dueAt,
+    lastResult: w.lastResult === 'right' || w.lastResult === 'wrong' ? w.lastResult : undefined,
+  }
+}
+
+function prevSafeFirstLevelId(cfg: AppConfig): number {
+  const ids = cfg.levels.map((l) => l.id).sort((a, b) => a - b)
+  return ids[0] ?? 1
+}
+
+function maxLevel(cfg: AppConfig): number {
+  const ids = cfg.levels.map((l) => l.id)
+  return ids.length ? Math.max(...ids) : 1
+}
+
+function clampToExistingLevel(levelId: number, cfg: AppConfig): number {
+  const ids = new Set(cfg.levels.map((l) => l.id))
+  if (ids.has(levelId)) return levelId
+  // If missing, clamp to nearest
+  const sorted = cfg.levels.map((l) => l.id).sort((a, b) => a - b)
+  if (!sorted.length) return 1
+  const min = sorted[0]
+  const max = sorted[sorted.length - 1]
+  if (levelId < min) return min
+  if (levelId > max) return max
+  // Otherwise choose closest existing
+  let best = sorted[0]
+  let bestDist = Math.abs(sorted[0] - levelId)
+  for (const id of sorted) {
+    const d = Math.abs(id - levelId)
+    if (d < bestDist) {
+      bestDist = d
+      best = id
+    }
+  }
+  return best
+}
+
+function applyAnswer(args: { word: WordItem; right: boolean; config: AppConfig }): WordItem {
+  const { word, right, config } = args
+  const now = new Date()
+  const nowIso = toISO(now)
+
+  const level = config.levels.find((l) => l.id === word.levelId) ?? config.levels[0]
+  const maxLevelId = maxLevel(config)
+
+  const updated: WordItem = {
+    ...word,
+    updatedAt: nowIso,
+    lastReviewedAt: nowIso,
+    lastResult: right ? 'right' : 'wrong',
+    totalRight: word.totalRight + (right ? 1 : 0),
+    totalWrong: word.totalWrong + (!right ? 1 : 0),
+  }
+
+  if (!right) {
+    if (config.wrongResetsStreak) updated.streakCorrect = 0
+    if (config.wrongMakesImmediatelyDue) {
+      updated.dueAt = nowIso
+    } else {
+      // If not immediate, keep dueAt as-is
+      updated.dueAt = word.dueAt
+    }
+    return updated
+  }
+
+  // Right answer
+  const nextStreak = word.streakCorrect + 1
+  updated.streakCorrect = nextStreak
+
+  // Schedule next due based on level interval days
+  const base = todayStartLocal() // make due stable relative to local day
+  const interval = clampInt(level?.intervalDays ?? 0, 0, 3650)
+  updated.dueAt = toISO(addDays(base, interval))
+
+  // Promote if threshold met and not at max
+  const threshold = clampInt(level?.promoteAfterCorrect ?? 1, 1, 99)
+  if (word.levelId < maxLevelId && nextStreak >= threshold) {
+    const nextLevelId = nextHigherLevelId(word.levelId, config)
+    updated.levelId = nextLevelId
+    updated.streakCorrect = 0
+
+    // After promotion, reschedule using the next level interval (due in that interval)
+    const promotedLevel = config.levels.find((l) => l.id === nextLevelId)
+    const promotedInterval = clampInt(promotedLevel?.intervalDays ?? interval, 0, 3650)
+    updated.dueAt = toISO(addDays(base, promotedInterval))
+  }
+
+  // If already max, keep there forever (no further promotion). dueAt still advances.
+  return updated
+}
+
+function nextHigherLevelId(current: number, cfg: AppConfig): number {
+  const sorted = cfg.levels.map((l) => l.id).sort((a, b) => a - b)
+  for (const id of sorted) {
+    if (id > current) return id
+  }
+  return sorted[sorted.length - 1] ?? current
+}
+
+function pickNextCardId(args: {
+  data: AppData
+  dueWords: WordItem[]
+  sessionWrongPool: string[]
+  avoidId?: string
+}): string | null {
+  const { data, dueWords, sessionWrongPool, avoidId } = args
+
+  // Strategy:
+  // 1) If we have sessionWrongPool IDs, pick the earliest-due among them.
+  // 2) Else pick the earliest-due among due words.
+  // 3) If none, return null.
+
+  const map = new Map<string, WordItem>()
+  for (const w of data.words) map.set(w.id, w)
+
+  const candidatesWrong = sessionWrongPool
+    .map((id) => map.get(id))
+    .filter(Boolean) as WordItem[]
+  candidatesWrong.sort(sortByDueThenUpdated)
+
+  const pickFrom = (list: WordItem[]) => {
+    if (!list.length) return null
+    if (avoidId && list.length > 1) {
+      const first = list.find((w) => w.id !== avoidId)
+      return first?.id ?? list[0].id
+    }
+    return list[0].id
+  }
+
+  const fromWrong = pickFrom(candidatesWrong)
+  if (fromWrong) return fromWrong
+
+  // Recompute due words from current data, not stale prop
+  const now = new Date()
+  const computedDue = data.words.filter((w) => isDue(w, now)).sort(sortByDueThenUpdated)
+
+  const fromDue = pickFrom(computedDue.length ? computedDue : dueWords)
+  return fromDue
+}
