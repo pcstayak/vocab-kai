@@ -113,6 +113,74 @@ export interface Database {
           updated_at?: string
         }
       }
+      vocab_versus_rooms: {
+        Row: {
+          id: string
+          room_code: string
+          player_a_id: string
+          player_b_id: string | null
+          status: string
+          current_turn: string | null
+          player_a_words: Json
+          player_b_words: Json
+          player_a_index: number
+          player_b_index: number
+          player_a_wrong_count: number
+          player_b_wrong_count: number
+          player_a_right_count: number
+          player_b_right_count: number
+          player_a_time: number
+          player_b_time: number
+          turn_start_time: string | null
+          winner_id: string | null
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          room_code: string
+          player_a_id: string
+          player_b_id?: string | null
+          status?: string
+          current_turn?: string | null
+          player_a_words?: Json
+          player_b_words?: Json
+          player_a_index?: number
+          player_b_index?: number
+          player_a_wrong_count?: number
+          player_b_wrong_count?: number
+          player_a_right_count?: number
+          player_b_right_count?: number
+          player_a_time?: number
+          player_b_time?: number
+          turn_start_time?: string | null
+          winner_id?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          room_code?: string
+          player_a_id?: string
+          player_b_id?: string | null
+          status?: string
+          current_turn?: string | null
+          player_a_words?: Json
+          player_b_words?: Json
+          player_a_index?: number
+          player_b_index?: number
+          player_a_wrong_count?: number
+          player_b_wrong_count?: number
+          player_a_right_count?: number
+          player_b_right_count?: number
+          player_a_time?: number
+          player_b_time?: number
+          turn_start_time?: string | null
+          winner_id?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+      }
     }
     Functions: {
       vocab_create_user_with_progress: {
@@ -125,6 +193,14 @@ export interface Database {
           hint_text: string
           definition_text: string
         }
+        Returns: string
+      }
+      create_versus_room: {
+        Args: { creator_user_id: string }
+        Returns: { room_code: string; room_id: string }[]
+      }
+      join_versus_room: {
+        Args: { p_room_code: string; p_user_id: string }
         Returns: string
       }
     }

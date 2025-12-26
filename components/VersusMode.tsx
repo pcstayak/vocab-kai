@@ -1,0 +1,521 @@
+'use client'
+
+import { useState, useEffect, useRef } from 'react'
+import type { RealtimeChannel } from '@supabase/supabase-js'
+import {
+  createVersusRoom,
+  joinVersusRoom,
+  getVersusRoom,
+  updateVersusRoom,
+  startVersusGame,
+  subscribeToVersusRoom,
+  type VersusRoom,
+  type VersusWord,
+} from '../lib/versus-operations'
+import { getAllWordsWithProgress } from '../lib/db-operations'
+import { soundPlayer } from '../lib/sound-utils'
+
+type VersusState = 'menu' | 'creating' | 'joining' | 'waiting' | 'playing' | 'finished'
+
+export default function VersusMode(props: {
+  currentUserId: string
+  currentUserName: string
+  onExit: () => void
+}) {
+  const { currentUserId, currentUserName, onExit } = props
+
+  const [state, setState] = useState<VersusState>('menu')
+  const [room, setRoom] = useState<VersusRoom | null>(null)
+  const [joinCode, setJoinCode] = useState('')
+  const [error, setError] = useState<string | null>(null)
+
+  const channelRef = useRef<RealtimeChannel | null>(null)
+  const turnTimerRef = useRef<NodeJS.Timeout | null>(null)
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (channelRef.current) {
+        channelRef.current.unsubscribe()
+      }
+      if (turnTimerRef.current) {
+        clearInterval(turnTimerRef.current)
+      }
+    }
+  }, [])
+
+  // Subscribe to room updates
+  useEffect(() => {
+    if (!room) return
+
+    const channel = subscribeToVersusRoom(room.id, (updatedRoom) => {
+      setRoom(updatedRoom)
+
+      // Update state based on room status
+      if (updatedRoom.status === 'active' && state === 'waiting') {
+        setState('playing')
+      } else if (updatedRoom.status === 'finished' && state === 'playing') {
+        setState('finished')
+      }
+    })
+
+    channelRef.current = channel
+
+    return () => {
+      channel.unsubscribe()
+      channelRef.current = null
+    }
+  }, [room?.id])
+
+  // Timer for current turn
+  useEffect(() => {
+    if (state !== 'playing' || !room || !room.currentTurn || !room.turnStartTime) return
+
+    if (turnTimerRef.current) {
+      clearInterval(turnTimerRef.current)
+    }
+
+    turnTimerRef.current = setInterval(() => {
+      if (!room.turnStartTime) return
+
+      const elapsed = Date.now() - new Date(room.turnStartTime).getTime()
+      const isPlayerA = currentUserId === room.playerAId
+
+      if (room.currentTurn === currentUserId) {
+        // Current player's timer
+        const newTime = isPlayerA ? room.playerATime + 1000 : room.playerBTime + 1000
+
+        updateVersusRoom(room.id, {
+          ...(isPlayerA ? { playerATime: newTime } : { playerBTime: newTime }),
+        }).catch(console.error)
+      }
+    }, 1000)
+
+    return () => {
+      if (turnTimerRef.current) {
+        clearInterval(turnTimerRef.current)
+        turnTimerRef.current = null
+      }
+    }
+  }, [state, room?.currentTurn, currentUserId])
+
+  async function handleCreateRoom() {
+    try {
+      setError(null)
+      setState('creating')
+
+      const { roomCode, roomId } = await createVersusRoom(currentUserId)
+      const roomData = await getVersusRoom(roomId)
+
+      if (roomData) {
+        setRoom(roomData)
+        setState('waiting')
+      }
+    } catch (err: any) {
+      console.error('Error creating room:', err)
+      setError(err.message || 'Failed to create room')
+      setState('menu')
+    }
+  }
+
+  async function handleJoinRoom() {
+    if (!joinCode.trim()) {
+      setError('Please enter a room code')
+      return
+    }
+
+    try {
+      setError(null)
+      setState('joining')
+
+      const roomId = await joinVersusRoom(joinCode.toUpperCase(), currentUserId)
+      const roomData = await getVersusRoom(roomId)
+
+      if (roomData) {
+        setRoom(roomData)
+
+        // Load words and start game
+        await initializeGame(roomData)
+      }
+    } catch (err: any) {
+      console.error('Error joining room:', err)
+      setError(err.message || 'Failed to join room')
+      setState('menu')
+    }
+  }
+
+  async function initializeGame(roomData: VersusRoom) {
+    try {
+      // Get 10 random due words for each player
+      const [playerAWords, playerBWords] = await Promise.all([
+        getAllWordsWithProgress(roomData.playerAId),
+        getAllWordsWithProgress(roomData.playerBId!),
+      ])
+
+      // Pick 10 random due words (words with dueAt <= now)
+      const now = new Date()
+      const playerADue = playerAWords.filter((w) => new Date(w.dueAt) <= now)
+      const playerBDue = playerBWords.filter((w) => new Date(w.dueAt) <= now)
+
+      const shuffleA = [...playerADue].sort(() => Math.random() - 0.5).slice(0, 10)
+      const shuffleB = [...playerBDue].sort(() => Math.random() - 0.5).slice(0, 10)
+
+      const wordsForA: VersusWord[] = shuffleB.map((w) => ({
+        id: w.id,
+        word: w.word,
+        hint: w.hint,
+        definition: w.definition,
+      }))
+
+      const wordsForB: VersusWord[] = shuffleA.map((w) => ({
+        id: w.id,
+        word: w.word,
+        hint: w.hint,
+        definition: w.definition,
+      }))
+
+      await startVersusGame(roomData.id, wordsForA, wordsForB)
+
+      setState('playing')
+    } catch (err) {
+      console.error('Error initializing game:', err)
+      setError('Failed to start game')
+    }
+  }
+
+  async function handleAnswer(correct: boolean) {
+    if (!room || room.currentTurn !== currentUserId) return
+
+    // Play right or wrong sound
+    soundPlayer.play(correct ? 'rightAnswer' : 'wrongAnswer')
+
+    const isPlayerA = currentUserId === room.playerAId
+    const currentIndex = isPlayerA ? room.playerAIndex : room.playerBIndex
+    const totalWords = isPlayerA ? room.playerAWords.length : room.playerBWords.length
+
+    if (correct) {
+      // Correct answer
+      const newIndex = currentIndex + 1
+      const newRightCount = isPlayerA ? room.playerARightCount + 1 : room.playerBRightCount + 1
+
+      if (newIndex >= totalWords) {
+        // Player finished all words!
+        await finishGame(isPlayerA)
+      } else {
+        // Continue with next word
+        await updateVersusRoom(room.id, {
+          ...(isPlayerA
+            ? { playerAIndex: newIndex, playerARightCount: newRightCount }
+            : { playerBIndex: newIndex, playerBRightCount: newRightCount }),
+        })
+      }
+    } else {
+      // Wrong answer - switch turns
+      const newWrongCount = isPlayerA ? room.playerAWrongCount + 1 : room.playerBWrongCount + 1
+      const nextTurn = isPlayerA ? room.playerBId! : room.playerAId
+
+      await updateVersusRoom(room.id, {
+        currentTurn: nextTurn,
+        turnStartTime: new Date().toISOString(),
+        ...(isPlayerA ? { playerAWrongCount: newWrongCount } : { playerBWrongCount: newWrongCount }),
+      })
+    }
+  }
+
+  async function finishGame(playerAFinished: boolean) {
+    if (!room) return
+
+    const otherPlayerIndex = playerAFinished ? room.playerBIndex : room.playerAIndex
+    const otherPlayerTotal = playerAFinished ? room.playerBWords.length : room.playerAWords.length
+
+    if (otherPlayerIndex >= otherPlayerTotal) {
+      // Both finished - compare times
+      const winnerId = room.playerATime < room.playerBTime ? room.playerAId : room.playerBId!
+
+      // Play winner revealed sound
+      soundPlayer.play('winnerRevealed')
+
+      await updateVersusRoom(room.id, {
+        status: 'finished',
+        winnerId,
+        currentTurn: null,
+      })
+    } else {
+      // Give other player a chance if current player never gave up turn
+      const currentWrongCount = playerAFinished ? room.playerAWrongCount : room.playerBWrongCount
+
+      if (currentWrongCount === 0) {
+        // Current player went flawless, give other player their turn
+        const nextTurn = playerAFinished ? room.playerBId! : room.playerAId
+
+        await updateVersusRoom(room.id, {
+          currentTurn: nextTurn,
+          turnStartTime: new Date().toISOString(),
+          ...(playerAFinished ? { playerAIndex: room.playerAWords.length } : { playerBIndex: room.playerBWords.length }),
+        })
+      } else {
+        // Current player wins
+        const winnerId = playerAFinished ? room.playerAId : room.playerBId!
+
+        // Play winner revealed sound
+        soundPlayer.play('winnerRevealed')
+
+        await updateVersusRoom(room.id, {
+          status: 'finished',
+          winnerId,
+          currentTurn: null,
+        })
+      }
+    }
+  }
+
+  function handleExit() {
+    if (channelRef.current) {
+      channelRef.current.unsubscribe()
+    }
+    if (turnTimerRef.current) {
+      clearInterval(turnTimerRef.current)
+    }
+    setRoom(null)
+    setState('menu')
+    onExit()
+  }
+
+  // Render different screens based on state
+  if (state === 'menu') {
+    return (
+      <div className="min-h-[60vh] flex items-center justify-center">
+        <div className="max-w-md w-full rounded-2xl border border-slate-800 bg-slate-900/30 p-8">
+          <h2 className="text-2xl font-bold text-center mb-6">Versus Mode</h2>
+
+          {error && (
+            <div className="mb-4 rounded-xl bg-rose-950/20 border border-rose-900/40 p-3 text-sm text-rose-200">
+              {error}
+            </div>
+          )}
+
+          <div className="space-y-4">
+            <button
+              onClick={handleCreateRoom}
+              className="w-full rounded-xl bg-emerald-400 px-6 py-4 text-lg font-semibold text-slate-950 hover:bg-emerald-300"
+            >
+              Create Room
+            </button>
+
+            <div className="text-center text-sm text-slate-400">or</div>
+
+            <div className="space-y-2">
+              <input
+                type="text"
+                value={joinCode}
+                onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                placeholder="Enter Room Code"
+                maxLength={4}
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-center text-2xl font-mono text-slate-100 placeholder:text-slate-500 outline-none focus:border-slate-400"
+              />
+              <button
+                onClick={handleJoinRoom}
+                disabled={!joinCode.trim()}
+                className="w-full rounded-xl bg-slate-100 px-6 py-4 text-lg font-semibold text-slate-950 hover:bg-white disabled:opacity-50"
+              >
+                Join Room
+              </button>
+            </div>
+          </div>
+
+          <button
+            onClick={handleExit}
+            className="mt-6 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
+          >
+            Back
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  if (state === 'waiting' && room) {
+    return (
+      <div className="min-h-[60vh] flex items-center justify-center">
+        <div className="max-w-md w-full rounded-2xl border border-slate-800 bg-slate-900/30 p-8 text-center">
+          <h2 className="text-2xl font-bold mb-4">Waiting for Opponent...</h2>
+
+          <div className="my-8 rounded-2xl bg-slate-950 p-6">
+            <div className="text-sm text-slate-400 mb-2">Room Code</div>
+            <div className="text-5xl font-mono font-bold tracking-wider">{room.roomCode}</div>
+          </div>
+
+          <p className="text-slate-300">Share this code with your opponent</p>
+
+          <button
+            onClick={handleExit}
+            className="mt-6 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  if (state === 'playing' && room) {
+    const isPlayerA = currentUserId === room.playerAId
+    const isMyTurn = room.currentTurn === currentUserId
+    const myWords = isPlayerA ? room.playerAWords : room.playerBWords
+    const myIndex = isPlayerA ? room.playerAIndex : room.playerBIndex
+    const currentWord = myWords[myIndex]
+
+    return (
+      <div className="max-w-4xl mx-auto">
+        <div className="grid gap-4">
+          {/* Game Header */}
+          <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+            <div className="grid grid-cols-2 gap-4">
+              <div className={`rounded-xl p-4 ${isMyTurn ? 'bg-emerald-950/20 border-2 border-emerald-400' : 'bg-slate-950/40 border border-slate-800'}`}>
+                <div className="text-sm text-slate-400">You</div>
+                <div className="text-xl font-bold">{currentUserName}</div>
+                <div className="mt-2 text-sm">
+                  Progress: {myIndex} / {myWords.length}
+                </div>
+                <div className="text-sm text-slate-300">
+                  Time: {formatTime(isPlayerA ? room.playerATime : room.playerBTime)}
+                </div>
+              </div>
+
+              <div className={`rounded-xl p-4 ${!isMyTurn ? 'bg-emerald-950/20 border-2 border-emerald-400' : 'bg-slate-950/40 border border-slate-800'}`}>
+                <div className="text-sm text-slate-400">Opponent</div>
+                <div className="text-xl font-bold">Player {isPlayerA ? 'B' : 'A'}</div>
+                <div className="mt-2 text-sm">
+                  Progress: {isPlayerA ? room.playerBIndex : room.playerAIndex} /{' '}
+                  {isPlayerA ? room.playerBWords.length : room.playerAWords.length}
+                </div>
+                <div className="text-sm text-slate-300">
+                  Time: {formatTime(isPlayerA ? room.playerBTime : room.playerATime)}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Current Word */}
+          <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-6">
+            {isMyTurn ? (
+              <div>
+                <div className="text-center mb-6">
+                  <div className="text-sm text-emerald-400 mb-2">YOUR TURN - Read this word:</div>
+                  <div className="text-5xl font-bold">{currentWord?.word || 'Loading...'}</div>
+                </div>
+
+                <div className="rounded-xl bg-slate-950/40 p-4 mb-6">
+                  <div className="text-sm text-slate-400 mb-2">Hint</div>
+                  <div className="text-slate-200">{currentWord?.hint || '—'}</div>
+                </div>
+
+                <div className="text-center text-sm text-slate-400 mb-6">
+                  Opponent must define this word. Did they get it right?
+                </div>
+
+                <div className="flex gap-4">
+                  <button
+                    onClick={() => handleAnswer(false)}
+                    className="flex-1 rounded-xl bg-rose-400 px-6 py-4 text-lg font-semibold text-slate-950 hover:bg-rose-300"
+                  >
+                    Wrong
+                  </button>
+                  <button
+                    onClick={() => handleAnswer(true)}
+                    className="flex-1 rounded-xl bg-emerald-400 px-6 py-4 text-lg font-semibold text-slate-950 hover:bg-emerald-300"
+                  >
+                    Right
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="text-center py-12">
+                <div className="text-lg text-slate-400 mb-4">Opponent's Turn</div>
+                <div className="text-3xl font-bold mb-2">Listen and Answer!</div>
+                <div className="text-slate-300">
+                  Your opponent will read you a word. Define it to keep your turn.
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (state === 'finished' && room) {
+    const isPlayerA = currentUserId === room.playerAId
+    const isWinner = room.winnerId === currentUserId
+
+    return (
+      <div className="min-h-[60vh] flex items-center justify-center">
+        <div className="max-w-2xl w-full rounded-2xl border border-slate-800 bg-slate-900/30 p-8">
+          <h2 className={`text-3xl font-bold text-center mb-8 ${isWinner ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {isWinner ? '🏆 You Win!' : 'You Lost'}
+          </h2>
+
+          <div className="grid grid-cols-2 gap-6 mb-8">
+            <div className="rounded-xl bg-slate-950/40 p-6">
+              <div className="text-sm text-slate-400 mb-2">You</div>
+              <div className="space-y-2 text-sm">
+                <div>
+                  Completed: {isPlayerA ? room.playerAIndex : room.playerBIndex} /{' '}
+                  {isPlayerA ? room.playerAWords.length : room.playerBWords.length}
+                </div>
+                <div>
+                  Right: {isPlayerA ? room.playerARightCount : room.playerBRightCount}
+                </div>
+                <div>
+                  Wrong: {isPlayerA ? room.playerAWrongCount : room.playerBWrongCount}
+                </div>
+                <div className="text-lg font-bold">
+                  Time: {formatTime(isPlayerA ? room.playerATime : room.playerBTime)}
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-xl bg-slate-950/40 p-6">
+              <div className="text-sm text-slate-400 mb-2">Opponent</div>
+              <div className="space-y-2 text-sm">
+                <div>
+                  Completed: {isPlayerA ? room.playerBIndex : room.playerAIndex} /{' '}
+                  {isPlayerA ? room.playerBWords.length : room.playerAWords.length}
+                </div>
+                <div>
+                  Right: {isPlayerA ? room.playerBRightCount : room.playerARightCount}
+                </div>
+                <div>
+                  Wrong: {isPlayerA ? room.playerBWrongCount : room.playerAWrongCount}
+                </div>
+                <div className="text-lg font-bold">
+                  Time: {formatTime(isPlayerA ? room.playerBTime : room.playerATime)}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <button
+            onClick={handleExit}
+            className="w-full rounded-xl bg-slate-100 px-6 py-4 text-lg font-semibold text-slate-950 hover:bg-white"
+          >
+            Back to Menu
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="min-h-[60vh] flex items-center justify-center">
+      <div className="text-lg text-slate-300">Loading...</div>
+    </div>
+  )
+}
+
+function formatTime(ms: number): string {
+  const seconds = Math.floor(ms / 1000)
+  const mins = Math.floor(seconds / 60)
+  const secs = seconds % 60
+  return `${mins}:${secs.toString().padStart(2, '0')}`
+}

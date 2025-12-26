@@ -1,10 +1,12 @@
 import { supabase, CONFIG_ID } from './supabase'
+import type { SoundsConfig } from './sound-types'
 
 // Types matching the app's data model
 export type AppConfig = {
   levels: LevelConfig[]
   wrongMakesImmediatelyDue: boolean
   wrongResetsStreak: boolean
+  sounds?: SoundsConfig
 }
 
 export type LevelConfig = {
@@ -46,6 +48,20 @@ export async function getAllUsers(): Promise<User[]> {
 
   if (error) throw error
   return data || []
+}
+
+export async function getUser(userId: string): Promise<User | null> {
+  const { data, error } = await supabase
+    .from('vocab_users')
+    .select('*')
+    .eq('id', userId)
+    .single()
+
+  if (error) {
+    if (error.code === 'PGRST116') return null // Not found
+    throw error
+  }
+  return data
 }
 
 export async function createUser(name: string): Promise<string> {

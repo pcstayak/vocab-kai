@@ -24,6 +24,7 @@ Cloud storage powered by Supabase. Data syncs across devices.
 
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import UserSelector from '../components/UserSelector'
+import VersusMode from '../components/VersusMode'
 import {
   getConfig,
   updateConfig,
@@ -33,9 +34,25 @@ import {
   deleteWord as dbDeleteWord,
   updateProgress,
   setWordLevel as dbSetWordLevel,
+  getUser,
   type AppConfig as DbAppConfig,
   type WordItem as DbWordItem,
 } from '../lib/db-operations'
+import {
+  type SoundsConfig,
+  type SoundEvent,
+  type SoundSource,
+  defaultSoundsConfig,
+  eventLabels,
+} from '../lib/sound-types'
+import {
+  soundPlayer,
+  uploadSound,
+  uploadSoundFromUrl,
+  previewSound,
+  listAllSounds,
+  deleteSound,
+} from '../lib/sound-utils'
 
 // ---------------- Types ----------------
 
@@ -56,6 +73,8 @@ type AppConfig = {
   wrongMakesImmediatelyDue: boolean
   // If true, a wrong answer resets the consecutive correct streak for the current level
   wrongResetsStreak: boolean
+  // Sound configuration (optional for backward compatibility)
+  sounds?: SoundsConfig
 }
 
 type WordItem = {
@@ -95,6 +114,7 @@ const defaultConfig: AppConfig = {
   ],
   wrongMakesImmediatelyDue: true,
   wrongResetsStreak: true,
+  sounds: defaultSoundsConfig,
 }
 
 const defaultData: AppData = {
@@ -178,10 +198,11 @@ function formatShortDateTime(iso?: string): string {
 
 // ---------------- Main Component ----------------
 
-type Tab = 'practice' | 'words' | 'settings'
+type Tab = 'practice' | 'versus' | 'words' | 'settings'
 
 export default function Page() {
   const [tab, setTab] = useState<Tab>('practice')
+  const [currentUserName, setCurrentUserName] = useState<string>('User')
 
   // User selection state
   const [currentUserId, setCurrentUserId] = useState<string | null>(null)
@@ -249,11 +270,16 @@ export default function Page() {
         setLoadError(null)
         setLoaded(false)
 
-        // Load config and words in parallel
-        const [config, words] = await Promise.all([
+        // Load config, words, and user name in parallel
+        const [config, words, userData] = await Promise.all([
           getConfig(),
           getAllWordsWithProgress(currentUserId),
+          getUser(currentUserId),
         ])
+
+        if (userData) {
+          setCurrentUserName(userData.name)
+        }
 
         setData({
           version: 1,
@@ -271,6 +297,13 @@ export default function Page() {
 
     loadUserData()
   }, [currentUserId])
+
+  // Initialize sound player when config changes
+  useEffect(() => {
+    if (data.config.sounds) {
+      soundPlayer.preload(data.config.sounds)
+    }
+  }, [data.config.sounds])
 
   // ---------------- Derived ----------------
 
@@ -362,6 +395,11 @@ export default function Page() {
     setCurrentId(next)
     setShowHint(false)
     setShowDef(false)
+
+    // Play card revealed sound
+    if (next) {
+      soundPlayer.play('cardRevealed')
+    }
   }
 
   function stopPractice() {
@@ -381,10 +419,18 @@ export default function Page() {
     setCurrentId(nextId)
     setShowHint(false)
     setShowDef(false)
+
+    // Play card revealed sound
+    if (nextId) {
+      soundPlayer.play('cardRevealed')
+    }
   }
 
   async function answer(right: boolean) {
     if (!currentWord || !currentUserId) return
+
+    // Play right or wrong sound
+    soundPlayer.play(right ? 'rightAnswer' : 'wrongAnswer')
 
     // Track if this word was failed during this session
     const wasFailedThisSession = sessionFailedWords.has(currentWord.id)
@@ -437,6 +483,7 @@ export default function Page() {
 
         if (nextWrongWords.length === 0) {
           // Lesson complete!
+          soundPlayer.play('gameEnd')
           stopPractice()
           return
         }
@@ -485,6 +532,7 @@ export default function Page() {
           pickNextAndResetViews(next)
         } else {
           // Perfect score! Lesson complete
+          soundPlayer.play('gameEnd')
           stopPractice()
         }
       } else {
@@ -870,6 +918,14 @@ export default function Page() {
             />
           )}
 
+          {tab === 'versus' && (
+            <VersusMode
+              currentUserId={currentUserId!}
+              currentUserName={currentUserName}
+              onExit={() => setTab('practice')}
+            />
+          )}
+
           {tab === 'words' && (
             <WordsTab
               data={data}
@@ -957,6 +1013,9 @@ function Header(props: {
           <div className="flex gap-2">
             <TopTabButton active={tab === 'practice'} onClick={() => setTab('practice')}>
               Practice
+            </TopTabButton>
+            <TopTabButton active={tab === 'versus'} onClick={() => setTab('versus')}>
+              Versus
             </TopTabButton>
             <TopTabButton active={tab === 'words'} onClick={() => setTab('words')}>
               Words
@@ -1475,6 +1534,306 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   )
 }
 
+function SoundsSettings(props: {
+  soundsConfig: SoundsConfig
+  setSoundsConfig: (config: SoundsConfig) => void
+}) {
+  const { soundsConfig, setSoundsConfig } = props
+  const [uploading, setUploading] = useState<SoundEvent | null>(null)
+  const [urlInput, setUrlInput] = useState<Record<SoundEvent, string>>({
+    cardRevealed: '',
+    rightAnswer: '',
+    wrongAnswer: '',
+    gameEnd: '',
+    winnerRevealed: '',
+  })
+  const [availableSounds, setAvailableSounds] = useState<Record<SoundEvent, string[]>>({
+    cardRevealed: [],
+    rightAnswer: [],
+    wrongAnswer: [],
+    gameEnd: [],
+    winnerRevealed: [],
+  })
+  const [loading, setLoading] = useState(true)
+
+  // Load available sounds from storage on mount
+  useEffect(() => {
+    async function loadSounds() {
+      try {
+        const sounds = await listAllSounds()
+        setAvailableSounds(sounds)
+      } catch (error) {
+        console.error('Failed to load sounds:', error)
+      } finally {
+        setLoading(false)
+      }
+    }
+    loadSounds()
+  }, [])
+
+  async function refreshSounds(event: SoundEvent) {
+    try {
+      const sounds = await listAllSounds()
+      setAvailableSounds(sounds)
+    } catch (error) {
+      console.error('Failed to refresh sounds:', error)
+    }
+  }
+
+  async function handleFileUpload(event: SoundEvent, file: File) {
+    try {
+      setUploading(event)
+      const path = await uploadSound(event, file)
+
+      // Refresh available sounds
+      await refreshSounds(event)
+
+      // Set as current sound
+      setSoundsConfig({
+        ...soundsConfig,
+        sounds: {
+          ...soundsConfig.sounds,
+          [event]: { mode: 'single', path },
+        },
+      })
+    } catch (error: any) {
+      alert(error.message || 'Failed to upload sound')
+    } finally {
+      setUploading(null)
+    }
+  }
+
+  async function handleUrlUpload(event: SoundEvent) {
+    const url = urlInput[event].trim()
+    if (!url) return
+
+    try {
+      setUploading(event)
+      const path = await uploadSoundFromUrl(event, url)
+
+      // Refresh available sounds
+      await refreshSounds(event)
+
+      // Set as current sound
+      setSoundsConfig({
+        ...soundsConfig,
+        sounds: {
+          ...soundsConfig.sounds,
+          [event]: { mode: 'single', path },
+        },
+      })
+
+      setUrlInput({ ...urlInput, [event]: '' })
+    } catch (error: any) {
+      alert(error.message || 'Failed to upload sound from URL')
+    } finally {
+      setUploading(null)
+    }
+  }
+
+  function handlePreview(event: SoundEvent) {
+    previewSound(soundsConfig.sounds[event], soundsConfig.volume)
+  }
+
+  function toggleRandomMode(event: SoundEvent, enabled: boolean) {
+    if (enabled) {
+      // Enable random mode with all available sounds for this event
+      setSoundsConfig({
+        ...soundsConfig,
+        sounds: {
+          ...soundsConfig.sounds,
+          [event]: { mode: 'random', paths: availableSounds[event] },
+        },
+      })
+    } else {
+      // Disable random mode, revert to none
+      setSoundsConfig({
+        ...soundsConfig,
+        sounds: {
+          ...soundsConfig.sounds,
+          [event]: { mode: 'none' },
+        },
+      })
+    }
+  }
+
+  return (
+    <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+      <div className="flex items-center justify-between mb-4">
+        <div className="text-sm font-semibold">Sound Effects</div>
+        <label className="flex items-center gap-2 text-sm text-slate-200">
+          <input
+            type="checkbox"
+            checked={soundsConfig.enabled}
+            onChange={(e) => setSoundsConfig({ ...soundsConfig, enabled: e.target.checked })}
+            className="h-4 w-4"
+          />
+          Enable sounds
+        </label>
+      </div>
+
+      {/* Master Volume Control */}
+      <div className="mb-6 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+        <Field label={`Master Volume: ${soundsConfig.volume}%`}>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            value={soundsConfig.volume}
+            onChange={(e) => setSoundsConfig({ ...soundsConfig, volume: Number(e.target.value) })}
+            className="w-full"
+            disabled={!soundsConfig.enabled}
+          />
+        </Field>
+      </div>
+
+      {/* Sound Event Configuration */}
+      <div className="grid gap-4">
+        {(Object.keys(eventLabels) as SoundEvent[]).map((event) => (
+          <div key={event} className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="text-sm font-semibold">{eventLabels[event]}</div>
+              <label className="flex items-center gap-2 text-xs text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={soundsConfig.sounds[event].mode === 'random'}
+                  onChange={(e) => toggleRandomMode(event, e.target.checked)}
+                  className="h-3.5 w-3.5"
+                  disabled={!soundsConfig.enabled || availableSounds[event].length === 0}
+                />
+                Random sound
+              </label>
+            </div>
+
+            {soundsConfig.sounds[event].mode === 'random' ? (
+              /* Random Mode Display */
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="rounded-xl border border-emerald-700 bg-emerald-950/20 px-3 py-2 text-sm text-emerald-300">
+                  Random from {soundsConfig.sounds[event].paths.length} sounds
+                </div>
+                <button
+                  onClick={() => handlePreview(event)}
+                  className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900 disabled:opacity-50"
+                  disabled={!soundsConfig.enabled || soundsConfig.sounds[event].paths.length === 0}
+                >
+                  Preview Random
+                </button>
+              </div>
+            ) : (
+              /* Normal Mode */
+              <div className="grid gap-3 sm:grid-cols-2">
+                {/* Sound Selection Dropdown */}
+                <Field label="Sound">
+                  <select
+                    value={soundsConfig.sounds[event].mode === 'single' ? soundsConfig.sounds[event].path : 'none'}
+                    onChange={(e) => {
+                      const value = e.target.value
+                      if (value === 'none') {
+                        setSoundsConfig({
+                          ...soundsConfig,
+                          sounds: {
+                            ...soundsConfig.sounds,
+                            [event]: { mode: 'none' },
+                          },
+                        })
+                      } else {
+                        setSoundsConfig({
+                          ...soundsConfig,
+                          sounds: {
+                            ...soundsConfig.sounds,
+                            [event]: { mode: 'single', path: value },
+                          },
+                        })
+                      }
+                    }}
+                    className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-slate-400"
+                    disabled={!soundsConfig.enabled || loading}
+                  >
+                    <option value="none">None</option>
+                    {availableSounds[event].map((path) => (
+                      <option key={path} value={path}>
+                        {path.split('/')[1]?.replace('.mp3', '').replace('.wav', '').replace('.ogg', '')}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+
+                {/* Preview Button */}
+                <div className="flex items-end">
+                  <button
+                    onClick={() => handlePreview(event)}
+                    className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900 disabled:opacity-50"
+                    disabled={!soundsConfig.enabled || soundsConfig.sounds[event].mode === 'none'}
+                  >
+                    Preview
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Upload Controls - Only show when not in random mode */}
+            {soundsConfig.sounds[event].mode !== 'random' && (
+              <div className="mt-3 grid gap-2">
+              <div className="flex gap-2">
+                <input
+                  type="file"
+                  accept="audio/*"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0]
+                    if (file) handleFileUpload(event, file)
+                  }}
+                  className="hidden"
+                  id={`sound-upload-${event}`}
+                  disabled={!soundsConfig.enabled}
+                />
+                <label
+                  htmlFor={`sound-upload-${event}`}
+                  className={`flex-1 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-semibold text-center text-slate-200 hover:bg-slate-900 cursor-pointer ${
+                    !soundsConfig.enabled ? 'opacity-50 cursor-not-allowed' : ''
+                  }`}
+                >
+                  {uploading === event ? 'Uploading...' : 'Upload File'}
+                </label>
+              </div>
+
+              {/* URL Input */}
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={urlInput[event]}
+                  onChange={(e) => setUrlInput({ ...urlInput, [event]: e.target.value })}
+                  placeholder="Or paste URL to audio file"
+                  className="flex-1 rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 outline-none focus:border-slate-400"
+                  disabled={!soundsConfig.enabled}
+                />
+                <button
+                  onClick={() => handleUrlUpload(event)}
+                  className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-xs font-semibold text-slate-200 hover:bg-slate-900 disabled:opacity-50"
+                  disabled={!soundsConfig.enabled || !urlInput[event].trim() || uploading === event}
+                >
+                  Add
+                </button>
+              </div>
+              </div>
+            )}
+
+            {loading && (
+              <div className="mt-2 text-xs text-slate-400">Loading available sounds...</div>
+            )}
+            {!loading && availableSounds[event].length === 0 && soundsConfig.sounds[event].mode !== 'random' && (
+              <div className="mt-2 text-xs text-amber-400">No sounds uploaded yet. Upload a sound file to get started.</div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-4 text-xs text-slate-400">
+        Supported formats: MP3, WAV, OGG. Max file size: 2MB.
+      </div>
+    </div>
+  )
+}
+
 function SettingsTab(props: {
   configDraft: AppConfig
   setConfigDraft: (c: AppConfig) => void
@@ -1652,6 +2011,11 @@ function SettingsTab(props: {
               </label>
             </div>
           </div>
+
+          <SoundsSettings
+            soundsConfig={configDraft.sounds || defaultSoundsConfig}
+            setSoundsConfig={(sounds) => setConfigDraft({ ...configDraft, sounds })}
+          />
 
           <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
             <div className="text-sm font-semibold">Storage and backups</div>
