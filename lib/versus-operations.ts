@@ -159,8 +159,23 @@ export function subscribeToVersusRoom(
         filter: `id=eq.${roomId}`,
       },
       (payload) => {
+        console.log('Realtime payload received:', {
+          eventType: payload.eventType,
+          hasNew: !!payload.new,
+          hasOld: !!payload.old,
+          newPlayerAWords: payload.new?.player_a_words,
+          newPlayerBWords: payload.new?.player_b_words,
+          newPlayerAWordsType: typeof payload.new?.player_a_words,
+          newPlayerBWordsType: typeof payload.new?.player_b_words,
+        })
+
         if (payload.new) {
-          callback(mapRoomFromDb(payload.new as any))
+          const mappedRoom = mapRoomFromDb(payload.new as any)
+          console.log('Mapped room:', {
+            playerAWordsLength: mappedRoom.playerAWords.length,
+            playerBWordsLength: mappedRoom.playerBWords.length,
+          })
+          callback(mappedRoom)
         }
       }
     )
@@ -171,6 +186,41 @@ export function subscribeToVersusRoom(
 
 // Helper to map database row to VersusRoom
 function mapRoomFromDb(data: any): VersusRoom {
+  // Parse JSONB columns if they come as strings (from realtime)
+  let playerAWords = data.player_a_words || []
+  let playerBWords = data.player_b_words || []
+
+  if (typeof playerAWords === 'string') {
+    try {
+      playerAWords = JSON.parse(playerAWords)
+    } catch (e) {
+      console.error('Failed to parse playerAWords:', e)
+      playerAWords = []
+    }
+  }
+
+  if (typeof playerBWords === 'string') {
+    try {
+      playerBWords = JSON.parse(playerBWords)
+    } catch (e) {
+      console.error('Failed to parse playerBWords:', e)
+      playerBWords = []
+    }
+  }
+
+  // Ensure arrays are actually arrays
+  if (!Array.isArray(playerAWords)) playerAWords = []
+  if (!Array.isArray(playerBWords)) playerBWords = []
+
+  console.log('mapRoomFromDb:', {
+    playerAWordsLength: playerAWords.length,
+    playerBWordsLength: playerBWords.length,
+    playerAWordsType: typeof data.player_a_words,
+    playerBWordsType: typeof data.player_b_words,
+    playerAIndex: data.player_a_index,
+    playerBIndex: data.player_b_index,
+  })
+
   return {
     id: data.id,
     roomCode: data.room_code,
@@ -178,8 +228,8 @@ function mapRoomFromDb(data: any): VersusRoom {
     playerBId: data.player_b_id,
     status: data.status,
     currentTurn: data.current_turn,
-    playerAWords: data.player_a_words || [],
-    playerBWords: data.player_b_words || [],
+    playerAWords,
+    playerBWords,
     playerAIndex: data.player_a_index || 0,
     playerBIndex: data.player_b_index || 0,
     playerAWrongCount: data.player_a_wrong_count || 0,

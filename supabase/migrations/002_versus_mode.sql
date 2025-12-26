@@ -2,12 +2,12 @@
 CREATE TABLE IF NOT EXISTS vocab_versus_rooms (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   room_code TEXT NOT NULL UNIQUE,
-  player_a_id TEXT NOT NULL REFERENCES vocab_users(id) ON DELETE CASCADE,
-  player_b_id TEXT REFERENCES vocab_users(id) ON DELETE CASCADE,
+  player_a_id UUID NOT NULL REFERENCES vocab_users(id) ON DELETE CASCADE,
+  player_b_id UUID REFERENCES vocab_users(id) ON DELETE CASCADE,
 
   -- Game state
   status TEXT NOT NULL DEFAULT 'waiting', -- 'waiting', 'active', 'finished'
-  current_turn TEXT, -- player_a_id or player_b_id
+  current_turn UUID, -- player_a_id or player_b_id
 
   -- Words for each player (10 words from opponent's due list)
   player_a_words JSONB DEFAULT '[]'::jsonb, -- Words player A must guess
@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS vocab_versus_rooms (
   turn_start_time TIMESTAMPTZ,
 
   -- Winner
-  winner_id TEXT,
+  winner_id UUID,
 
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -53,7 +53,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Function to create a new versus room
-CREATE OR REPLACE FUNCTION create_versus_room(creator_user_id TEXT)
+CREATE OR REPLACE FUNCTION create_versus_room(creator_user_id UUID)
 RETURNS TABLE(room_code TEXT, room_id UUID) AS $$
 DECLARE
   new_code TEXT;
@@ -87,13 +87,13 @@ $$ LANGUAGE plpgsql;
 -- Function to join a versus room
 CREATE OR REPLACE FUNCTION join_versus_room(
   p_room_code TEXT,
-  p_user_id TEXT
+  p_user_id UUID
 )
 RETURNS UUID AS $$
 DECLARE
   v_room_id UUID;
-  v_player_a_id TEXT;
-  v_player_b_id TEXT;
+  v_player_a_id UUID;
+  v_player_b_id UUID;
   v_status TEXT;
 BEGIN
   -- Get room details

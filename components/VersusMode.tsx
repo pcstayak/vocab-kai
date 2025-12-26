@@ -91,6 +91,16 @@ export default function VersusMode(props: {
     if (!room) return
 
     const channel = subscribeToVersusRoom(room.id, (updatedRoom) => {
+      // Preserve word arrays if they're missing in the update (shouldn't happen, but defensive)
+      if (updatedRoom.playerAWords.length === 0 && room.playerAWords.length > 0) {
+        console.warn('Realtime update missing playerAWords, preserving existing')
+        updatedRoom.playerAWords = room.playerAWords
+      }
+      if (updatedRoom.playerBWords.length === 0 && room.playerBWords.length > 0) {
+        console.warn('Realtime update missing playerBWords, preserving existing')
+        updatedRoom.playerBWords = room.playerBWords
+      }
+
       setRoom(updatedRoom)
 
       // Update state based on room status
@@ -111,7 +121,7 @@ export default function VersusMode(props: {
       channel.unsubscribe()
       channelRef.current = null
     }
-  }, [room?.id, state])
+  }, [room?.id, state, room?.playerAWords, room?.playerBWords])
 
   // Timer for current turn
   useEffect(() => {
@@ -196,7 +206,7 @@ export default function VersusMode(props: {
 
   async function initializeGame(roomData: VersusRoom) {
     try {
-      // Get 10 random due words for each player
+      // Get all words for each player
       const [playerAWords, playerBWords] = await Promise.all([
         getAllWordsWithProgress(roomData.playerAId),
         getAllWordsWithProgress(roomData.playerBId!),
@@ -204,12 +214,33 @@ export default function VersusMode(props: {
 
       // Pick 10 random due words (words with dueAt <= now)
       const now = new Date()
-      const playerADue = playerAWords.filter((w) => new Date(w.dueAt) <= now)
-      const playerBDue = playerBWords.filter((w) => new Date(w.dueAt) <= now)
+      let playerADue = playerAWords.filter((w) => new Date(w.dueAt) <= now)
+      let playerBDue = playerBWords.filter((w) => new Date(w.dueAt) <= now)
+
+      // Fallback: if not enough due words, use all words
+      if (playerADue.length < 3) {
+        playerADue = playerAWords
+      }
+      if (playerBDue.length < 3) {
+        playerBDue = playerBWords
+      }
+
+      // Validate: both players must have at least 1 word
+      if (playerADue.length === 0) {
+        setError('Player A has no words in their vocabulary. Add some words first!')
+        setState('menu')
+        return
+      }
+      if (playerBDue.length === 0) {
+        setError('Player B has no words in their vocabulary. Add some words first!')
+        setState('menu')
+        return
+      }
 
       const shuffleA = [...playerADue].sort(() => Math.random() - 0.5).slice(0, 10)
       const shuffleB = [...playerBDue].sort(() => Math.random() - 0.5).slice(0, 10)
 
+      // Player A gets Player B's words to read
       const wordsForA: VersusWord[] = shuffleB.map((w) => ({
         id: w.id,
         word: w.word,
@@ -217,6 +248,7 @@ export default function VersusMode(props: {
         definition: w.definition,
       }))
 
+      // Player B gets Player A's words to read
       const wordsForB: VersusWord[] = shuffleA.map((w) => ({
         id: w.id,
         word: w.word,
@@ -230,6 +262,7 @@ export default function VersusMode(props: {
     } catch (err) {
       console.error('Error initializing game:', err)
       setError('Failed to start game')
+      setState('menu')
     }
   }
 
@@ -433,6 +466,20 @@ export default function VersusMode(props: {
     const myWords = isPlayerA ? room.playerAWords : room.playerBWords
     const myIndex = isPlayerA ? room.playerAIndex : room.playerBIndex
     const currentWord = myWords[myIndex]
+
+    // Debug logging
+    if (!currentWord) {
+      console.log('DEBUG: No current word!', {
+        isPlayerA,
+        isMyTurn,
+        myWordsLength: myWords.length,
+        myIndex,
+        roomPlayerAWords: room.playerAWords.length,
+        roomPlayerBWords: room.playerBWords.length,
+        roomPlayerAIndex: room.playerAIndex,
+        roomPlayerBIndex: room.playerBIndex,
+      })
+    }
 
     return (
       <div className="max-w-4xl mx-auto">
