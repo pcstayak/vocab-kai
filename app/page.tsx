@@ -192,11 +192,16 @@ export default function Page() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [importing, setImporting] = useState(false)
 
-  // Practice state
+  // Practice state - New lesson-based structure
   const [practiceMode, setPracticeMode] = useState(false)
   const [showHint, setShowHint] = useState(false)
   const [showDef, setShowDef] = useState(false)
-  const [sessionWrongPool, setSessionWrongPool] = useState<string[]>([]) // word IDs to re-ask
+  const [lessonPlan, setLessonPlan] = useState<string[]>([]) // 10 words planned for lesson
+  const [lessonIndex, setLessonIndex] = useState(0) // Current position in lesson (0-9)
+  const [lessonWrongWords, setLessonWrongWords] = useState<string[]>([]) // Words to review at end
+  const [isReviewingWrong, setIsReviewingWrong] = useState(false) // Whether in review phase
+  const [lastReviewWordId, setLastReviewWordId] = useState<string | null>(null) // Avoid immediate repeat
+  const [sessionFailedWords, setSessionFailedWords] = useState<Set<string>>(new Set()) // Words failed this session (no streak for these)
   const [sessionSeenCount, setSessionSeenCount] = useState(0)
   const [sessionRightCount, setSessionRightCount] = useState(0)
   const [sessionWrongCount, setSessionWrongCount] = useState(0)
@@ -317,40 +322,43 @@ export default function Page() {
   useEffect(() => {
     if (!practiceMode) return
 
-    // Ensure current card exists; if not, pick next.
-    if (!currentId) {
-      const next = pickNextCardId({
-        data,
-        dueWords,
-        sessionWrongPool,
-      })
-      setCurrentId(next)
+    // Ensure current card exists; if not, this means we need to start fresh
+    if (!currentId && lessonPlan.length > 0) {
+      // Pick the current card from lesson plan or review pool
+      if (isReviewingWrong && lessonWrongWords.length > 0) {
+        const randomIndex = Math.floor(Math.random() * lessonWrongWords.length)
+        setCurrentId(lessonWrongWords[randomIndex])
+      } else if (lessonIndex < lessonPlan.length) {
+        setCurrentId(lessonPlan[lessonIndex])
+      }
       setShowHint(false)
       setShowDef(false)
       return
     }
 
-    // If current became deleted, move on
+    // If current became deleted, stop practice
     if (currentId && !data.words.some((w) => w.id === currentId)) {
-      const next = pickNextCardId({
-        data,
-        dueWords,
-        sessionWrongPool,
-      })
-      setCurrentId(next)
-      setShowHint(false)
-      setShowDef(false)
+      stopPractice()
     }
-  }, [practiceMode, currentId, data, dueWords, sessionWrongPool])
+  }, [practiceMode, currentId, data, lessonPlan, lessonIndex, isReviewingWrong, lessonWrongWords])
 
   function startPractice() {
+    // Pick 10 random due words for the lesson
+    const shuffled = [...dueWords].sort(() => Math.random() - 0.5)
+    const plan = shuffled.slice(0, 10).map(w => w.id)
+
     setPracticeMode(true)
-    setSessionWrongPool([])
+    setLessonPlan(plan)
+    setLessonIndex(0)
+    setLessonWrongWords([])
+    setIsReviewingWrong(false)
+    setLastReviewWordId(null)
+    setSessionFailedWords(new Set())
     setSessionSeenCount(0)
     setSessionRightCount(0)
     setSessionWrongCount(0)
 
-    const next = pickNextCardId({ data, dueWords, sessionWrongPool: [] })
+    const next = plan[0] || null
     setCurrentId(next)
     setShowHint(false)
     setShowDef(false)
@@ -361,7 +369,12 @@ export default function Page() {
     setCurrentId(null)
     setShowHint(false)
     setShowDef(false)
-    setSessionWrongPool([])
+    setLessonPlan([])
+    setLessonIndex(0)
+    setLessonWrongWords([])
+    setIsReviewingWrong(false)
+    setLastReviewWordId(null)
+    setSessionFailedWords(new Set())
   }
 
   function pickNextAndResetViews(nextId: string | null) {
@@ -373,10 +386,19 @@ export default function Page() {
   async function answer(right: boolean) {
     if (!currentWord || !currentUserId) return
 
+    // Track if this word was failed during this session
+    const wasFailedThisSession = sessionFailedWords.has(currentWord.id)
+
+    // If answering wrong, mark as failed for this session
+    if (!right) {
+      setSessionFailedWords(new Set([...sessionFailedWords, currentWord.id]))
+    }
+
     const updated = applyAnswer({
       word: currentWord,
       right,
       config: data.config,
+      isCleanRun: !wasFailedThisSession, // Only count streak if never failed this session
     })
 
     // Update word list optimistically
@@ -403,31 +425,75 @@ export default function Page() {
     if (right) setSessionRightCount((n) => n + 1)
     else setSessionWrongCount((n) => n + 1)
 
-    // Wrong -> add to sessionWrongPool (re-ask in same session)
-    let nextWrongPool = sessionWrongPool
-    if (!right) {
-      if (!sessionWrongPool.includes(updated.id)) {
-        nextWrongPool = [...sessionWrongPool, updated.id]
-        setSessionWrongPool(nextWrongPool)
+    // Handle lesson flow
+    if (isReviewingWrong) {
+      // In review mode
+      setLastReviewWordId(updated.id)
+
+      if (right) {
+        // Remove from wrong words pool
+        const nextWrongWords = lessonWrongWords.filter(id => id !== updated.id)
+        setLessonWrongWords(nextWrongWords)
+
+        if (nextWrongWords.length === 0) {
+          // Lesson complete!
+          stopPractice()
+          return
+        }
+
+        // Pick next review word (avoiding the one we just did)
+        let candidates = nextWrongWords
+        if (nextWrongWords.length > 1) {
+          candidates = nextWrongWords.filter(id => id !== updated.id)
+        }
+        const randomIndex = Math.floor(Math.random() * candidates.length)
+        const next = candidates[randomIndex]
+        pickNextAndResetViews(next)
+      } else {
+        // Got it wrong again in review, pick another word from the pool
+        let candidates = lessonWrongWords
+        if (lessonWrongWords.length > 1) {
+          candidates = lessonWrongWords.filter(id => id !== updated.id)
+        }
+        const randomIndex = Math.floor(Math.random() * candidates.length)
+        const next = candidates[randomIndex]
+        pickNextAndResetViews(next)
       }
     } else {
-      // If answered right and it was in the wrong pool, remove it (so it stops repeating)
-      if (sessionWrongPool.includes(updated.id)) {
-        nextWrongPool = sessionWrongPool.filter((id) => id !== updated.id)
-        setSessionWrongPool(nextWrongPool)
+      // In main lesson
+      const nextIndex = lessonIndex + 1
+
+      // Update wrong words list if needed
+      let nextWrongWords = lessonWrongWords
+      if (!right && !lessonWrongWords.includes(updated.id)) {
+        nextWrongWords = [...lessonWrongWords, updated.id]
+        setLessonWrongWords(nextWrongWords)
+      }
+
+      // Check if we finished the main lesson
+      if (nextIndex >= lessonPlan.length) {
+        // Finished all 10 words
+        if (nextWrongWords.length > 0) {
+          // Switch to review mode
+          setIsReviewingWrong(true)
+          setLessonIndex(nextIndex)
+
+          // Pick first review word
+          const randomIndex = Math.floor(Math.random() * nextWrongWords.length)
+          const next = nextWrongWords[randomIndex]
+          setLastReviewWordId(next)
+          pickNextAndResetViews(next)
+        } else {
+          // Perfect score! Lesson complete
+          stopPractice()
+        }
+      } else {
+        // Continue with next word in lesson plan
+        setLessonIndex(nextIndex)
+        const next = lessonPlan[nextIndex]
+        pickNextAndResetViews(next)
       }
     }
-
-    // Pick next
-    const next = pickNextCardId({
-      data: { ...data, words: data.words.map((w) => (w.id === updated.id ? updated : w)) },
-      dueWords,
-      sessionWrongPool: nextWrongPool,
-      // Avoid immediate repeat unless that's all we have
-      avoidId: updated.id,
-    })
-
-    pickNextAndResetViews(next)
   }
 
   // ---------------- Word CRUD ----------------
@@ -518,7 +584,8 @@ export default function Page() {
         setCurrentId(null)
       }
       if (editId === id) resetDraft()
-      setSessionWrongPool((pool) => pool.filter((x) => x !== id))
+      // Remove from lesson wrong words if it's there
+      setLessonWrongWords((pool) => pool.filter((x) => x !== id))
     } catch (error) {
       console.error('Error deleting word:', error)
     }
@@ -794,7 +861,10 @@ export default function Page() {
                 seen: sessionSeenCount,
                 right: sessionRightCount,
                 wrong: sessionWrongCount,
-                wrongPoolCount: sessionWrongPool.length,
+                lessonProgress: isReviewingWrong
+                  ? `Review: ${lessonWrongWords.length} remaining`
+                  : `Word ${lessonIndex + 1} of ${lessonPlan.length}`,
+                isReviewing: isReviewingWrong,
               }}
               levelMap={levelMap}
             />
@@ -960,7 +1030,7 @@ function PracticeTab(props: {
   setShowHint: React.Dispatch<React.SetStateAction<boolean>>
   setShowDef: React.Dispatch<React.SetStateAction<boolean>>
   onAnswer: (right: boolean) => void
-  session: { seen: number; right: number; wrong: number; wrongPoolCount: number }
+  session: { seen: number; right: number; wrong: number; lessonProgress: string; isReviewing: boolean }
   levelMap: Map<number, LevelConfig>
 }) {
   const {
@@ -1011,12 +1081,11 @@ function PracticeTab(props: {
         ) : (
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
-              <div className="text-lg font-semibold">Session</div>
+              <div className="text-lg font-semibold">{session.isReviewing ? 'Review Mode' : 'Lesson'}</div>
               <div className="mt-1 text-sm text-slate-300">
-                Seen: <span className="font-medium text-slate-100">{session.seen}</span> • Right:{' '}
+                <span className="font-medium text-slate-100">{session.lessonProgress}</span> • Right:{' '}
                 <span className="font-medium text-slate-100">{session.right}</span> • Wrong:{' '}
-                <span className="font-medium text-slate-100">{session.wrong}</span> • Pending repeats:{' '}
-                <span className="font-medium text-slate-100">{session.wrongPoolCount}</span>
+                <span className="font-medium text-slate-100">{session.wrong}</span>
               </div>
             </div>
             <div className="flex gap-2">
@@ -1168,10 +1237,11 @@ function PracticeTab(props: {
             <div className="text-sm text-slate-300">
               How it works:
               <ul className="ml-5 mt-1 list-disc text-slate-400">
-                <li>Only due cards show up in practice.</li>
-                <li>Wrong answers repeat again during the same session.</li>
+                <li>Each lesson contains 10 random words from your due cards.</li>
+                <li>Wrong answers are saved until the end of the lesson.</li>
+                <li>After the 10 words, you review wrong words until all are correct.</li>
                 <li>Correct answers increase streak; when streak hits the level threshold, the card promotes.</li>
-                <li>Intervals and thresholds are configurable in Settings.</li>
+                <li>Levels and intervals are configurable in Settings.</li>
               </ul>
             </div>
           </div>
@@ -1750,8 +1820,13 @@ function clampToExistingLevel(levelId: number, cfg: AppConfig): number {
   return best
 }
 
-function applyAnswer(args: { word: WordItem; right: boolean; config: AppConfig }): WordItem {
-  const { word, right, config } = args
+function applyAnswer(args: {
+  word: WordItem;
+  right: boolean;
+  config: AppConfig;
+  isCleanRun?: boolean; // True if never failed this word during current session
+}): WordItem {
+  const { word, right, config, isCleanRun = true } = args
   const now = new Date()
   const nowIso = toISO(now)
 
@@ -1778,8 +1853,9 @@ function applyAnswer(args: { word: WordItem; right: boolean; config: AppConfig }
     return updated
   }
 
-  // Right answer
-  const nextStreak = word.streakCorrect + 1
+  // Right answer - but only increment streak if this is a clean run
+  // (word wasn't failed earlier in this session)
+  const nextStreak = isCleanRun ? word.streakCorrect + 1 : word.streakCorrect
   updated.streakCorrect = nextStreak
 
   // Schedule next due based on level interval days
@@ -1787,9 +1863,9 @@ function applyAnswer(args: { word: WordItem; right: boolean; config: AppConfig }
   const interval = clampInt(level?.intervalDays ?? 0, 0, 3650)
   updated.dueAt = toISO(addDays(base, interval))
 
-  // Promote if threshold met and not at max
+  // Promote if threshold met and not at max (only if clean run)
   const threshold = clampInt(level?.promoteAfterCorrect ?? 1, 1, 99)
-  if (word.levelId < maxLevelId && nextStreak >= threshold) {
+  if (isCleanRun && word.levelId < maxLevelId && nextStreak >= threshold) {
     const nextLevelId = nextHigherLevelId(word.levelId, config)
     updated.levelId = nextLevelId
     updated.streakCorrect = 0
@@ -1812,43 +1888,3 @@ function nextHigherLevelId(current: number, cfg: AppConfig): number {
   return sorted[sorted.length - 1] ?? current
 }
 
-function pickNextCardId(args: {
-  data: AppData
-  dueWords: WordItem[]
-  sessionWrongPool: string[]
-  avoidId?: string
-}): string | null {
-  const { data, dueWords, sessionWrongPool, avoidId } = args
-
-  // Strategy:
-  // 1) If we have sessionWrongPool IDs, pick the earliest-due among them.
-  // 2) Else pick the earliest-due among due words.
-  // 3) If none, return null.
-
-  const map = new Map<string, WordItem>()
-  for (const w of data.words) map.set(w.id, w)
-
-  const candidatesWrong = sessionWrongPool
-    .map((id) => map.get(id))
-    .filter(Boolean) as WordItem[]
-  candidatesWrong.sort(sortByDueThenUpdated)
-
-  const pickFrom = (list: WordItem[]) => {
-    if (!list.length) return null
-    if (avoidId && list.length > 1) {
-      const first = list.find((w) => w.id !== avoidId)
-      return first?.id ?? list[0].id
-    }
-    return list[0].id
-  }
-
-  const fromWrong = pickFrom(candidatesWrong)
-  if (fromWrong) return fromWrong
-
-  // Recompute due words from current data, not stale prop
-  const now = new Date()
-  const computedDue = data.words.filter((w) => isDue(w, now)).sort(sortByDueThenUpdated)
-
-  const fromDue = pickFrom(computedDue.length ? computedDue : dueWords)
-  return fromDue
-}
