@@ -1,20 +1,23 @@
 /*
-Spaced Repetition Vocab Trainer — Single-file Next.js (App Router) page.
+Spaced Repetition Vocab Trainer — Multi-user Next.js (App Router) app with Supabase.
 
 ✅ What you get:
 - 3 pages in one file (tabs): Practice, Words, Settings
-- Local persistence (localStorage) for words, progress, config
+- Cloud persistence via Supabase (words, progress per user, global config)
+- Multi-user support with per-user progress tracking
+- Text-to-speech pronunciation using Web Speech API
 - Configurable levels, promotion requirements, review intervals
 - Practice queue that repeats "wrong" items in-session
 - Scheduling that uses due dates (daily/weekly/monthly by default, configurable)
 - Import/Export JSON for backup
 
-⚠️ How to use on Vercel (Next.js + Tailwind):
+⚠️ How to use on Vercel (Next.js + Tailwind + Supabase):
 - Create a Next.js app (App Router)
-- Put this file at: app/page.tsx
-- Tailwind should already be configured (standard Next+Tailwind template)
+- Set up Supabase project and configure environment variables
+- Run database migrations to create tables
+- Deploy to Vercel
 
-No server/database required. Works offline in browser.
+Cloud storage powered by Supabase. Data syncs across devices.
 */
 
 'use client'
@@ -187,6 +190,7 @@ export default function Page() {
   const [data, setData] = useState<AppData>(defaultData)
   const [loaded, setLoaded] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [importing, setImporting] = useState(false)
 
   // Practice state
   const [practiceMode, setPracticeMode] = useState(false)
@@ -497,7 +501,6 @@ export default function Page() {
       resetDraft()
     } catch (error) {
       console.error('Error saving word:', error)
-      alert('Failed to save word. Please try again.')
     }
   }
 
@@ -518,7 +521,6 @@ export default function Page() {
       setSessionWrongPool((pool) => pool.filter((x) => x !== id))
     } catch (error) {
       console.error('Error deleting word:', error)
-      alert('Failed to delete word. Please try again.')
     }
   }
 
@@ -547,7 +549,6 @@ export default function Page() {
       }))
     } catch (error) {
       console.error('Error updating word level:', error)
-      alert('Failed to update word level. Please try again.')
     }
   }
 
@@ -566,19 +567,16 @@ export default function Page() {
       setConfigDraft(normalized)
     } catch (error) {
       console.error('Error saving config:', error)
-      alert('Failed to save settings. Please try again.')
     }
   }
 
   function switchUser() {
-    if (confirm('Switch user? Your progress has been saved.')) {
-      localStorage.removeItem('selectedUserId')
-      setCurrentUserId(null)
-      setData(defaultData)
-      setLoaded(false)
-      stopPractice()
-      resetDraft()
-    }
+    localStorage.removeItem('selectedUserId')
+    setCurrentUserId(null)
+    setData(defaultData)
+    setLoaded(false)
+    stopPractice()
+    resetDraft()
   }
 
   function resetToDefaults() {
@@ -595,17 +593,72 @@ export default function Page() {
     URL.revokeObjectURL(url)
   }
 
-  function importJsonFromText() {
+  async function importJsonFromText() {
+    if (!currentUserId || importing) return
+
     const parsed = safeJsonParse<AppData>(importText)
     if (!parsed || parsed.version !== 1 || !parsed.config || !Array.isArray(parsed.words)) {
-      alert('Import failed: invalid JSON or wrong format.')
+      console.error('Import failed: invalid JSON or wrong format.')
       return
     }
-    const cfg = normalizeConfig(parsed.config)
-    const words = parsed.words.map((w) => normalizeWord(w, cfg))
-    setData({ version: 1, config: cfg, words })
-    setConfigDraft(cfg)
-    setImportText('')
+
+    setImporting(true)
+
+    try {
+      const cfg = normalizeConfig(parsed.config)
+
+      // Save config to database
+      await updateConfig(cfg)
+
+      // Get current words to check for existing ones
+      const currentWords = await getAllWordsWithProgress(currentUserId)
+      const wordMap = new Map(currentWords.map(w => [w.word.toLowerCase(), w]))
+
+      // Import words - process them but don't update progress in the loop
+      for (const w of parsed.words) {
+        const normalized = normalizeWord(w, cfg)
+        const existingWord = wordMap.get(normalized.word.toLowerCase())
+
+        let wordId: string
+        if (existingWord) {
+          // Update existing word
+          await dbUpdateWord(existingWord.id, normalized.word, normalized.hint, normalized.definition)
+          wordId = existingWord.id
+        } else {
+          // Create new word (this automatically creates progress for ALL users via RPC function)
+          wordId = await dbCreateWord(normalized.word, normalized.hint, normalized.definition)
+        }
+
+        // Update progress for current user to match imported values
+        await updateProgress(currentUserId, wordId, {
+          levelId: normalized.levelId,
+          streakCorrect: normalized.streakCorrect,
+          totalRight: normalized.totalRight,
+          totalWrong: normalized.totalWrong,
+          lastReviewedAt: normalized.lastReviewedAt || toISO(new Date()),
+          dueAt: normalized.dueAt,
+          lastResult: normalized.lastResult || 'right',
+        })
+      }
+
+      // Reload data from database ONCE at the end
+      const [config, words] = await Promise.all([
+        getConfig(),
+        getAllWordsWithProgress(currentUserId),
+      ])
+
+      setData({
+        version: 1,
+        config,
+        words,
+      })
+      setConfigDraft(config)
+      setImportText('')
+    } catch (error) {
+      console.error('Error importing data:', error)
+    } finally {
+      setImporting(false)
+    }
   }
 
   async function importJsonFromFile(file: File) {
@@ -613,13 +666,51 @@ export default function Page() {
     setImportText(text)
   }
 
-  function wipeAllData() {
-    if (!confirm('This will delete all words, progress and settings. Continue?')) return
-    setData(defaultData)
-    setConfigDraft(defaultConfig)
-    stopPractice()
-    resetDraft()
-    setSearch('')
+  async function wipeAllData() {
+    if (!currentUserId) return
+
+    if (!confirm('Reset all your progress? This cannot be undone.')) {
+      return
+    }
+
+    try {
+      // Reset config to defaults
+      await updateConfig(defaultConfig)
+
+      // Reset current user's progress for all words to Level 1
+      const firstLevelId = defaultConfig.levels[0].id
+      const nowIso = toISO(new Date())
+
+      for (const word of data.words) {
+        await updateProgress(currentUserId, word.id, {
+          levelId: firstLevelId,
+          streakCorrect: 0,
+          totalRight: 0,
+          totalWrong: 0,
+          lastReviewedAt: nowIso,
+          dueAt: nowIso,
+          lastResult: 'right',
+        })
+      }
+
+      // Reload data from database
+      const [config, words] = await Promise.all([
+        getConfig(),
+        getAllWordsWithProgress(currentUserId),
+      ])
+
+      setData({
+        version: 1,
+        config,
+        words,
+      })
+      setConfigDraft(config)
+      stopPractice()
+      resetDraft()
+      setSearch('')
+    } catch (error) {
+      console.error('Error resetting progress:', error)
+    }
   }
 
   // ---------------- UI ----------------
@@ -744,6 +835,7 @@ export default function Page() {
               importJsonFromFile={importJsonFromFile}
               wipeAllData={wipeAllData}
               fileInputRef={fileInputRef}
+              importing={importing}
             />
           )}
         </main>
@@ -1321,10 +1413,11 @@ function SettingsTab(props: {
   exportJson: () => void
   importText: string
   setImportText: (v: string) => void
-  importJsonFromText: () => void
+  importJsonFromText: () => Promise<void>
   importJsonFromFile: (file: File) => Promise<void>
-  wipeAllData: () => void
+  wipeAllData: () => Promise<void>
   fileInputRef: React.RefObject<HTMLInputElement | null>
+  importing: boolean
 }) {
   const {
     configDraft,
@@ -1338,6 +1431,7 @@ function SettingsTab(props: {
     importJsonFromFile,
     wipeAllData,
     fileInputRef,
+    importing,
   } = props
 
   const levels = configDraft.levels
@@ -1492,8 +1586,8 @@ function SettingsTab(props: {
           <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
             <div className="text-sm font-semibold">Storage and backups</div>
             <div className="mt-2 text-sm text-slate-300">
-              This app uses <span className="font-semibold text-slate-100">localStorage</span>.
-              If you clear browser data or switch devices, you lose data unless you export.
+              This app uses <span className="font-semibold text-slate-100">Supabase</span> for cloud storage.
+              Your data syncs automatically across devices. You can still export/import for backups.
             </div>
             <div className="mt-3 flex flex-wrap gap-2">
               <button
@@ -1530,10 +1624,10 @@ function SettingsTab(props: {
               />
               <button
                 onClick={importJsonFromText}
-                className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-white disabled:opacity-50"
-                disabled={!importText.trim()}
+                className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-white disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={!importText.trim() || importing}
               >
-                Import from text
+                {importing ? 'Importing...' : 'Import from text'}
               </button>
             </div>
           </div>
@@ -1554,11 +1648,11 @@ function SettingsTab(props: {
       </div>
 
       <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
-        <div className="text-sm font-semibold">Notes about Vercel hosting</div>
+        <div className="text-sm font-semibold">About this multi-user system</div>
         <div className="mt-2 text-sm text-slate-300">
-          Vercel free tier hosting is stateless. Without an external DB, server-side persistence is not guaranteed.
-          This app uses browser storage, which is reliable for a single device.
-          If you want cross-device sync, the next step is adding Supabase (Auth + Postgres) and saving words/config per user.
+          This app uses Supabase (PostgreSQL) for cloud storage. Words are shared across all users,
+          while progress is tracked individually per user. Configuration settings are global and affect all users.
+          Your data syncs automatically and is accessible from any device.
         </div>
       </div>
     </div>
