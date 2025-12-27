@@ -159,18 +159,19 @@ export function subscribeToVersusRoom(
         filter: `id=eq.${roomId}`,
       },
       (payload) => {
+        const payloadData = payload.new as any
         console.log('Realtime payload received:', {
           eventType: payload.eventType,
           hasNew: !!payload.new,
           hasOld: !!payload.old,
-          newPlayerAWords: payload.new?.player_a_words,
-          newPlayerBWords: payload.new?.player_b_words,
-          newPlayerAWordsType: typeof payload.new?.player_a_words,
-          newPlayerBWordsType: typeof payload.new?.player_b_words,
+          newPlayerAWords: payloadData?.player_a_words,
+          newPlayerBWords: payloadData?.player_b_words,
+          newPlayerAWordsType: typeof payloadData?.player_a_words,
+          newPlayerBWordsType: typeof payloadData?.player_b_words,
         })
 
         if (payload.new) {
-          const mappedRoom = mapRoomFromDb(payload.new as any)
+          const mappedRoom = mapRoomFromDb(payloadData)
           console.log('Mapped room:', {
             playerAWordsLength: mappedRoom.playerAWords.length,
             playerBWordsLength: mappedRoom.playerBWords.length,

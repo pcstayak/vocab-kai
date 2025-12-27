@@ -39,15 +39,20 @@ export default function VersusMode(props: {
   useEffect(() => {
     async function attemptRejoin() {
       const savedRoomId = localStorage.getItem(ROOM_STORAGE_KEY)
-      if (!savedRoomId) return
+      if (!savedRoomId) {
+        setIsRejoining(false)
+        return
+      }
 
       try {
         setIsRejoining(true)
+        console.log('Attempting to rejoin room:', savedRoomId)
         const roomData = await getVersusRoom(savedRoomId)
 
         if (roomData && roomData.status !== 'finished') {
           // Verify user is part of this room
           if (roomData.playerAId === currentUserId || roomData.playerBId === currentUserId) {
+            console.log('Rejoined room successfully:', roomData.roomCode, 'status:', roomData.status)
             setRoom(roomData)
 
             if (roomData.status === 'waiting') {
@@ -57,14 +62,17 @@ export default function VersusMode(props: {
             }
           } else {
             // User not part of room, clear storage
+            console.warn('User not part of saved room, clearing')
             localStorage.removeItem(ROOM_STORAGE_KEY)
           }
         } else {
           // Room finished or doesn't exist, clear storage
+          console.log('Room finished or not found, clearing storage')
           localStorage.removeItem(ROOM_STORAGE_KEY)
         }
       } catch (err) {
         console.error('Failed to rejoin room:', err)
+        setError('Failed to reconnect to previous room')
         localStorage.removeItem(ROOM_STORAGE_KEY)
       } finally {
         setIsRejoining(false)
@@ -194,8 +202,17 @@ export default function VersusMode(props: {
         // Save room ID to localStorage for rejoin capability
         localStorage.setItem(ROOM_STORAGE_KEY, roomId)
 
-        // Load words and start game
-        await initializeGame(roomData)
+        // If room is active, we're rejoining - just start playing
+        if (roomData.status === 'active') {
+          console.log('Rejoining active game')
+          setState('playing')
+        } else if (roomData.status === 'waiting') {
+          // New join - initialize the game
+          await initializeGame(roomData)
+        } else {
+          setError('Room is no longer available')
+          setState('menu')
+        }
       }
     } catch (err: any) {
       console.error('Error joining room:', err)

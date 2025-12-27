@@ -106,19 +106,22 @@ BEGIN
     RAISE EXCEPTION 'Room not found';
   END IF;
 
-  IF v_status != 'waiting' THEN
-    RAISE EXCEPTION 'Room is not available';
+  -- Allow rejoining if user is already a player in this room
+  IF v_player_a_id = p_user_id OR v_player_b_id = p_user_id THEN
+    -- User is already in this room, allow them to rejoin
+    RETURN v_room_id;
   END IF;
 
-  IF v_player_a_id = p_user_id THEN
-    RAISE EXCEPTION 'Cannot join your own room';
+  -- For new joins, only allow if room is waiting
+  IF v_status != 'waiting' THEN
+    RAISE EXCEPTION 'Room is not available';
   END IF;
 
   IF v_player_b_id IS NOT NULL THEN
     RAISE EXCEPTION 'Room is full';
   END IF;
 
-  -- Join the room
+  -- Join the room as player B
   UPDATE vocab_versus_rooms
   SET player_b_id = p_user_id,
       updated_at = NOW()
