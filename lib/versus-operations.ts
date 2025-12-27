@@ -8,6 +8,7 @@ export type VersusWord = {
   word: string
   hint: string
   definition: string
+  imageUrl?: string
 }
 
 export type VersusRoom = {

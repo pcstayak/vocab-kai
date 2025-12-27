@@ -21,6 +21,7 @@ export type WordItem = {
   word: string
   hint: string
   definition: string
+  imageUrl?: string
   createdAt: string
   updatedAt: string
   levelId: number
@@ -125,6 +126,7 @@ export async function getAllWordsWithProgress(userId: string): Promise<WordItem[
     word: word.word,
     hint: word.hint,
     definition: word.definition,
+    imageUrl: word.image_url || undefined,
     createdAt: word.created_at,
     updatedAt: word.updated_at,
     levelId: word.vocab_user_progress[0]?.level_id || 1,
@@ -160,11 +162,17 @@ export async function updateWord(
   wordId: string,
   word: string,
   hint: string,
-  definition: string
+  definition: string,
+  imageUrl?: string
 ): Promise<void> {
+  const updateData: any = { word, hint, definition }
+  if (imageUrl !== undefined) {
+    updateData.image_url = imageUrl
+  }
+
   const { error } = await (supabase as any)
     .from('vocab_words')
-    .update({ word, hint, definition })
+    .update(updateData)
     .eq('id', wordId)
 
   if (error) throw error
@@ -253,6 +261,7 @@ export async function getDueWords(userId: string): Promise<WordItem[]> {
     word: progress.word.word,
     hint: progress.word.hint,
     definition: progress.word.definition,
+    imageUrl: progress.word.image_url || undefined,
     createdAt: progress.word.created_at,
     updatedAt: progress.word.updated_at,
     levelId: progress.level_id,

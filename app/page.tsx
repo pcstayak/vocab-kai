@@ -25,6 +25,7 @@ Cloud storage powered by Supabase. Data syncs across devices.
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import UserSelector from '../components/UserSelector'
 import VersusMode from '../components/VersusMode'
+import ReverseMode from '../components/ReverseMode'
 import {
   getConfig,
   updateConfig,
@@ -38,6 +39,8 @@ import {
   type AppConfig as DbAppConfig,
   type WordItem as DbWordItem,
 } from '../lib/db-operations'
+import { uploadWordImage, deleteWordImage } from '../lib/word-image-utils'
+import { generateQuestion, selectRandomWords } from '../lib/reverse-word-selection'
 import {
   type SoundsConfig,
   type SoundEvent,
@@ -82,6 +85,7 @@ type WordItem = {
   word: string
   hint: string
   definition: string
+  imageUrl?: string
   createdAt: ISODateString
   updatedAt: ISODateString
 
@@ -198,7 +202,7 @@ function formatShortDateTime(iso?: string): string {
 
 // ---------------- Main Component ----------------
 
-type Tab = 'practice' | 'versus' | 'words' | 'settings'
+type Tab = 'practice' | 'versus' | 'reverse' | 'words' | 'settings'
 
 export default function Page() {
   const [tab, setTab] = useState<Tab>('practice')
@@ -217,6 +221,7 @@ export default function Page() {
   const [practiceMode, setPracticeMode] = useState(false)
   const [showHint, setShowHint] = useState(false)
   const [showDef, setShowDef] = useState(false)
+  const [showImage, setShowImage] = useState(false)
   const [lessonPlan, setLessonPlan] = useState<string[]>([]) // 10 words planned for lesson
   const [lessonIndex, setLessonIndex] = useState(0) // Current position in lesson (0-9)
   const [lessonWrongWords, setLessonWrongWords] = useState<string[]>([]) // Words to review at end
@@ -230,11 +235,24 @@ export default function Page() {
   // Current card id for practice
   const [currentId, setCurrentId] = useState<string | null>(null)
 
+  // Reverse quiz state (single-player)
+  const [reverseQuizMode, setReverseQuizMode] = useState(false)
+  const [reverseQuizWords, setReverseQuizWords] = useState<WordItem[]>([])
+  const [reverseQuizIndex, setReverseQuizIndex] = useState(0)
+  const [reverseCurrentQuestion, setReverseCurrentQuestion] = useState<any>(null)
+  const [reverseSelectedAnswer, setReverseSelectedAnswer] = useState<string | null>(null)
+  const [reverseHasAnswered, setReverseHasAnswered] = useState(false)
+  const [reverseStreak, setReverseStreak] = useState(0)
+  const [reverseBestStreak, setReverseBestStreak] = useState(0)
+  const [reverseCorrectCount, setReverseCorrectCount] = useState(0)
+
   // Words editor state
   const [editId, setEditId] = useState<string | null>(null)
   const [draftWord, setDraftWord] = useState('')
   const [draftHint, setDraftHint] = useState('')
   const [draftDef, setDraftDef] = useState('')
+  const [draftImageUrl, setDraftImageUrl] = useState<string | undefined>(undefined)
+  const [draftImageFile, setDraftImageFile] = useState<File | null>(null)
   const [search, setSearch] = useState('')
 
   // Settings state
@@ -366,6 +384,7 @@ export default function Page() {
       }
       setShowHint(false)
       setShowDef(false)
+      setShowImage(false)
       return
     }
 
@@ -395,6 +414,7 @@ export default function Page() {
     setCurrentId(next)
     setShowHint(false)
     setShowDef(false)
+    setShowImage(false)
 
     // Play card revealed sound
     if (next) {
@@ -407,6 +427,7 @@ export default function Page() {
     setCurrentId(null)
     setShowHint(false)
     setShowDef(false)
+    setShowImage(false)
     setLessonPlan([])
     setLessonIndex(0)
     setLessonWrongWords([])
@@ -419,6 +440,7 @@ export default function Page() {
     setCurrentId(nextId)
     setShowHint(false)
     setShowDef(false)
+    setShowImage(false)
 
     // Play card revealed sound
     if (nextId) {
@@ -544,6 +566,141 @@ export default function Page() {
     }
   }
 
+  // ---------------- Reverse Quiz (Single-Player) ----------------
+
+  async function startReverseQuiz() {
+    if (!currentUserId) return
+
+    try {
+      const allWords = data.words
+
+      if (allWords.length < 13) {
+        alert('Need at least 13 words to play Reverse Quiz (10 questions + 3 for options)')
+        return
+      }
+
+      // Select 10 random words
+      const selectedWords = selectRandomWords(allWords, 10)
+      setReverseQuizWords(selectedWords)
+      setReverseQuizIndex(0)
+      setReverseStreak(0)
+      setReverseBestStreak(0)
+      setReverseCorrectCount(0)
+
+      // Generate first question
+      const firstQuestion = generateQuestion(selectedWords[0], allWords)
+      setReverseCurrentQuestion(firstQuestion)
+      setReverseSelectedAnswer(null)
+      setReverseHasAnswered(false)
+
+      setReverseQuizMode(true)
+    } catch (err: any) {
+      alert(err.message || 'Failed to start reverse quiz')
+    }
+  }
+
+  function stopReverseQuiz() {
+    setReverseQuizMode(false)
+    setReverseQuizWords([])
+    setReverseQuizIndex(0)
+    setReverseCurrentQuestion(null)
+    setReverseSelectedAnswer(null)
+    setReverseHasAnswered(false)
+    setReverseStreak(0)
+    setReverseBestStreak(0)
+    setReverseCorrectCount(0)
+  }
+
+  async function handleReverseAnswer(wordId: string) {
+    if (!reverseCurrentQuestion || reverseHasAnswered || !currentUserId) return
+
+    const isCorrect = wordId === reverseCurrentQuestion.wordId
+    setReverseSelectedAnswer(wordId)
+    setReverseHasAnswered(true)
+
+    // Play sound
+    soundPlayer.play(isCorrect ? 'rightAnswer' : 'wrongAnswer')
+
+    // Update streak and stats
+    if (isCorrect) {
+      setReverseStreak((s) => s + 1)
+      setReverseBestStreak((b) => Math.max(b, reverseStreak + 1))
+      setReverseCorrectCount((c) => c + 1)
+
+      // Update word progress (mark as correct)
+      const currentWord = reverseQuizWords[reverseQuizIndex]
+      const lvl = levelMap.get(currentWord.levelId)
+      if (lvl) {
+        const newStreak = currentWord.streakCorrect + 1
+        const shouldPromote = newStreak >= lvl.promoteAfterCorrect
+        const nextLevelId = shouldPromote
+          ? Math.min(currentWord.levelId + 1, data.config.levels[data.config.levels.length - 1].id)
+          : currentWord.levelId
+        const nextLvl = shouldPromote ? levelMap.get(nextLevelId) : lvl
+        const nextStreak = shouldPromote ? 0 : newStreak
+
+        const dueDate = addDays(new Date(), nextLvl?.intervalDays ?? 1)
+
+        updateProgress(currentUserId, currentWord.id, {
+          levelId: nextLevelId,
+          streakCorrect: nextStreak,
+          totalRight: currentWord.totalRight + 1,
+          totalWrong: currentWord.totalWrong,
+          lastReviewedAt: new Date().toISOString(),
+          dueAt: dueDate.toISOString(),
+          lastResult: 'right',
+        }).catch((err) => console.error('Error saving progress:', err))
+      }
+    } else {
+      setReverseStreak(0)
+
+      // Update word progress (mark as wrong)
+      const currentWord = reverseQuizWords[reverseQuizIndex]
+      const lvl = levelMap.get(currentWord.levelId)
+      if (lvl) {
+        const newStreak = data.config.wrongResetsStreak ? 0 : currentWord.streakCorrect
+        const dueDate = data.config.wrongMakesImmediatelyDue
+          ? new Date()
+          : addDays(new Date(), lvl.intervalDays)
+
+        updateProgress(currentUserId, currentWord.id, {
+          levelId: currentWord.levelId,
+          streakCorrect: newStreak,
+          totalRight: currentWord.totalRight,
+          totalWrong: currentWord.totalWrong + 1,
+          lastReviewedAt: new Date().toISOString(),
+          dueAt: dueDate.toISOString(),
+          lastResult: 'wrong',
+        }).catch((err) => console.error('Error saving progress:', err))
+      }
+    }
+
+    // Wait a bit, then advance to next question
+    setTimeout(() => {
+      advanceReverseQuestion()
+    }, 1500)
+  }
+
+  function advanceReverseQuestion() {
+    const nextIndex = reverseQuizIndex + 1
+
+    if (nextIndex >= reverseQuizWords.length) {
+      // Quiz complete - show results
+      setReverseQuizIndex(reverseQuizWords.length) // Set to length to trigger completion screen
+      soundPlayer.play('gameEnd')
+      return
+    }
+
+    // Generate next question
+    const nextWord = reverseQuizWords[nextIndex]
+    const nextQuestion = generateQuestion(nextWord, data.words)
+
+    setReverseQuizIndex(nextIndex)
+    setReverseCurrentQuestion(nextQuestion)
+    setReverseSelectedAnswer(null)
+    setReverseHasAnswered(false)
+  }
+
   // ---------------- Word CRUD ----------------
 
   function resetDraft() {
@@ -551,6 +708,8 @@ export default function Page() {
     setDraftWord('')
     setDraftHint('')
     setDraftDef('')
+    setDraftImageUrl(undefined)
+    setDraftImageFile(null)
   }
 
   function beginEdit(w: WordItem) {
@@ -558,6 +717,8 @@ export default function Page() {
     setDraftWord(w.word)
     setDraftHint(w.hint)
     setDraftDef(w.definition)
+    setDraftImageUrl(w.imageUrl)
+    setDraftImageFile(null)
   }
 
   async function saveDraft() {
@@ -569,9 +730,22 @@ export default function Page() {
     const nowIso = toISO(new Date())
 
     try {
+      let finalImageUrl = draftImageUrl
+
       if (editId) {
+        // Handle image upload/update for existing word
+        if (draftImageFile) {
+          // Upload new image
+          const newImageUrl = await uploadWordImage(editId, draftImageFile)
+          // Delete old image if it exists
+          if (draftImageUrl) {
+            await deleteWordImage(draftImageUrl)
+          }
+          finalImageUrl = newImageUrl
+        }
+
         // Update existing word
-        await dbUpdateWord(editId, word, hint, definition)
+        await dbUpdateWord(editId, word, hint, definition, finalImageUrl)
 
         setData((prev) => ({
           ...prev,
@@ -582,6 +756,7 @@ export default function Page() {
                   word,
                   hint,
                   definition,
+                  imageUrl: finalImageUrl,
                   updatedAt: nowIso,
                 }
               : w
@@ -591,12 +766,20 @@ export default function Page() {
         // Create new word (database function creates progress for all users)
         const newWordId = await dbCreateWord(word, hint, definition)
 
+        // Upload image if provided
+        if (draftImageFile) {
+          finalImageUrl = await uploadWordImage(newWordId, draftImageFile)
+          // Update the word with the image URL
+          await dbUpdateWord(newWordId, word, hint, definition, finalImageUrl)
+        }
+
         const firstLevelId = prevSafeFirstLevelId(data.config)
         const item: WordItem = {
           id: newWordId,
           word,
           hint,
           definition,
+          imageUrl: finalImageUrl,
           createdAt: nowIso,
           updatedAt: nowIso,
           levelId: firstLevelId,
@@ -881,6 +1064,7 @@ export default function Page() {
             if (t !== 'practice') {
               setShowHint(false)
               setShowDef(false)
+              setShowImage(false)
             }
           }}
           stats={stats}
@@ -902,8 +1086,10 @@ export default function Page() {
               currentWord={currentWord}
               showHint={showHint}
               showDef={showDef}
+              showImage={showImage}
               setShowHint={setShowHint}
               setShowDef={setShowDef}
+              setShowImage={setShowImage}
               onAnswer={answer}
               session={{
                 seen: sessionSeenCount,
@@ -915,11 +1101,31 @@ export default function Page() {
                 isReviewing: isReviewingWrong,
               }}
               levelMap={levelMap}
+              reverseQuizMode={reverseQuizMode}
+              reverseCurrentQuestion={reverseCurrentQuestion}
+              reverseSelectedAnswer={reverseSelectedAnswer}
+              reverseHasAnswered={reverseHasAnswered}
+              reverseQuizIndex={reverseQuizIndex}
+              reverseQuizWords={reverseQuizWords}
+              reverseStreak={reverseStreak}
+              reverseBestStreak={reverseBestStreak}
+              reverseCorrectCount={reverseCorrectCount}
+              onStartReverseQuiz={startReverseQuiz}
+              onStopReverseQuiz={stopReverseQuiz}
+              onReverseAnswer={handleReverseAnswer}
             />
           )}
 
           {tab === 'versus' && (
             <VersusMode
+              currentUserId={currentUserId!}
+              currentUserName={currentUserName}
+              onExit={() => setTab('practice')}
+            />
+          )}
+
+          {tab === 'reverse' && (
+            <ReverseMode
               currentUserId={currentUserId!}
               currentUserName={currentUserName}
               onExit={() => setTab('practice')}
@@ -933,11 +1139,13 @@ export default function Page() {
               search={search}
               setSearch={setSearch}
               editId={editId}
-              draft={{ word: draftWord, hint: draftHint, def: draftDef }}
+              draft={{ word: draftWord, hint: draftHint, def: draftDef, imageUrl: draftImageUrl, imageFile: draftImageFile }}
               setDraft={{
                 setWord: setDraftWord,
                 setHint: setDraftHint,
                 setDef: setDraftDef,
+                setImageUrl: setDraftImageUrl,
+                setImageFile: setDraftImageFile,
               }}
               onBeginEdit={beginEdit}
               onCancelEdit={resetDraft}
@@ -1017,6 +1225,9 @@ function Header(props: {
             <TopTabButton active={tab === 'versus'} onClick={() => setTab('versus')}>
               Versus
             </TopTabButton>
+            <TopTabButton active={tab === 'reverse'} onClick={() => setTab('reverse')}>
+              Reverse
+            </TopTabButton>
             <TopTabButton active={tab === 'words'} onClick={() => setTab('words')}>
               Words
             </TopTabButton>
@@ -1086,11 +1297,25 @@ function PracticeTab(props: {
   currentWord: WordItem | null
   showHint: boolean
   showDef: boolean
+  showImage: boolean
   setShowHint: React.Dispatch<React.SetStateAction<boolean>>
   setShowDef: React.Dispatch<React.SetStateAction<boolean>>
+  setShowImage: React.Dispatch<React.SetStateAction<boolean>>
   onAnswer: (right: boolean) => void
   session: { seen: number; right: number; wrong: number; lessonProgress: string; isReviewing: boolean }
   levelMap: Map<number, LevelConfig>
+  reverseQuizMode: boolean
+  reverseCurrentQuestion: any
+  reverseSelectedAnswer: string | null
+  reverseHasAnswered: boolean
+  reverseQuizIndex: number
+  reverseQuizWords: WordItem[]
+  reverseStreak: number
+  reverseBestStreak: number
+  reverseCorrectCount: number
+  onStartReverseQuiz: () => void
+  onStopReverseQuiz: () => void
+  onReverseAnswer: (wordId: string) => void
 }) {
   const {
     dueWords,
@@ -1101,11 +1326,25 @@ function PracticeTab(props: {
     currentWord,
     showHint,
     showDef,
+    showImage,
     setShowHint,
     setShowDef,
+    setShowImage,
     onAnswer,
     session,
     levelMap,
+    reverseQuizMode,
+    reverseCurrentQuestion,
+    reverseSelectedAnswer,
+    reverseHasAnswered,
+    reverseQuizIndex,
+    reverseQuizWords,
+    reverseStreak,
+    reverseBestStreak,
+    reverseCorrectCount,
+    onStartReverseQuiz,
+    onStopReverseQuiz,
+    onReverseAnswer,
   } = props
 
   const lvl = currentWord ? levelMap.get(currentWord.levelId) : undefined
@@ -1113,7 +1352,7 @@ function PracticeTab(props: {
   return (
     <div className="grid gap-4">
       <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
-        {!practiceMode ? (
+        {!practiceMode && !reverseQuizMode ? (
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <div className="text-lg font-semibold">Practice</div>
@@ -1130,10 +1369,35 @@ function PracticeTab(props: {
                 Start session
               </button>
               <button
+                onClick={onStartReverseQuiz}
+                className="rounded-xl bg-purple-600 px-4 py-2 text-sm font-semibold text-white hover:bg-purple-700"
+              >
+                Reverse Quiz
+              </button>
+              <button
                 onClick={onStop}
                 className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
               >
                 Reset
+              </button>
+            </div>
+          </div>
+        ) : reverseQuizMode ? (
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <div className="text-lg font-semibold">Reverse Quiz</div>
+              <div className="mt-1 text-sm text-slate-300">
+                Question {reverseQuizIndex + 1} of {reverseQuizWords.length} • Streak:{' '}
+                <span className="font-medium text-slate-100">{reverseStreak}</span> • Correct:{' '}
+                <span className="font-medium text-slate-100">{reverseCorrectCount}</span>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={onStopReverseQuiz}
+                className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
+              >
+                Stop Quiz
               </button>
             </div>
           </div>
@@ -1238,6 +1502,31 @@ function PracticeTab(props: {
                     </div>
                   </div>
 
+                  {currentWord.imageUrl && (
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="text-sm font-semibold">Image Hint</div>
+                        <button
+                          className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-900"
+                          onClick={() => setShowImage((v) => !v)}
+                        >
+                          {showImage ? 'Hide' : 'Show image'}
+                        </button>
+                      </div>
+                      <div className="mt-2">
+                        <img
+                          src={currentWord.imageUrl}
+                          alt="Word hint"
+                          className={`w-full max-w-md rounded-lg transition-all duration-300 ${
+                            showImage ? '' : 'blur-lg cursor-pointer'
+                          }`}
+                          onClick={() => !showImage && setShowImage(true)}
+                          style={{ filter: showImage ? 'none' : 'blur(12px)' }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
                   <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
                     <div className="flex items-center justify-between gap-3">
                       <div className="text-sm font-semibold">Definition</div>
@@ -1290,6 +1579,81 @@ function PracticeTab(props: {
             </div>
           )}
         </div>
+      ) : reverseQuizMode && reverseCurrentQuestion ? (
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
+          {reverseQuizIndex >= reverseQuizWords.length ? (
+            <div className="flex flex-col items-center gap-6 py-10 text-center">
+              <div className="text-3xl font-bold text-emerald-400">Quiz Complete!</div>
+              <div className="space-y-2">
+                <div className="text-2xl text-white">
+                  {reverseCorrectCount} / {reverseQuizWords.length} correct
+                </div>
+                <div className="text-lg text-slate-300">
+                  Best streak: <span className="font-semibold text-emerald-400">{reverseBestStreak}</span>
+                </div>
+              </div>
+              <button
+                onClick={onStopReverseQuiz}
+                className="rounded-xl bg-emerald-600 px-6 py-3 text-sm font-semibold text-white hover:bg-emerald-700"
+              >
+                Back to Practice
+              </button>
+            </div>
+          ) : (
+            <div className="grid gap-6">
+              {/* Definition */}
+              <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-6">
+                <div className="text-center space-y-2">
+                  <div className="text-xs text-slate-500 uppercase tracking-wide">Definition</div>
+                  <div className="text-xl text-white leading-relaxed">
+                    {reverseCurrentQuestion.definition}
+                  </div>
+                </div>
+              </div>
+
+              {/* Options */}
+              <div className="space-y-3">
+                <div className="text-center text-slate-400 text-sm">Choose the correct word:</div>
+                {reverseCurrentQuestion.options.map((option: any) => {
+                  const isSelected = reverseSelectedAnswer === option.id
+                  const isCorrect = option.id === reverseCurrentQuestion.wordId
+                  const showResult = reverseHasAnswered
+
+                  return (
+                    <button
+                      key={option.id}
+                      onClick={() => !reverseHasAnswered && onReverseAnswer(option.id)}
+                      disabled={reverseHasAnswered}
+                      className={`w-full py-5 px-6 rounded-xl font-semibold text-lg transition
+                        ${
+                          showResult && isCorrect
+                            ? 'bg-emerald-600 text-white ring-4 ring-emerald-400'
+                            : showResult && isSelected && !isCorrect
+                            ? 'bg-red-600 text-white ring-4 ring-red-400'
+                            : isSelected
+                            ? 'bg-purple-600 text-white ring-4 ring-purple-400'
+                            : 'bg-slate-700 hover:bg-slate-600 text-white'
+                        }
+                        ${reverseHasAnswered && !isSelected && !isCorrect ? 'opacity-50' : ''}
+                        ${reverseHasAnswered ? 'cursor-default' : 'cursor-pointer'}
+                      `}
+                    >
+                      {option.word}
+                      {showResult && isCorrect && ' ✓'}
+                      {showResult && isSelected && !isCorrect && ' ✗'}
+                    </button>
+                  )
+                })}
+              </div>
+
+              {reverseHasAnswered && (
+                <div className="text-center text-sm text-slate-400">
+                  Moving to next question...
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       ) : (
         <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-5">
           <div className="grid gap-2">
@@ -1325,8 +1689,8 @@ function WordsTab(props: {
   search: string
   setSearch: (v: string) => void
   editId: string | null
-  draft: { word: string; hint: string; def: string }
-  setDraft: { setWord: (v: string) => void; setHint: (v: string) => void; setDef: (v: string) => void }
+  draft: { word: string; hint: string; def: string; imageUrl?: string; imageFile: File | null }
+  setDraft: { setWord: (v: string) => void; setHint: (v: string) => void; setDef: (v: string) => void; setImageUrl: (v: string | undefined) => void; setImageFile: (v: File | null) => void }
   onBeginEdit: (w: WordItem) => void
   onCancelEdit: () => void
   onSave: () => void
@@ -1403,6 +1767,43 @@ function WordsTab(props: {
                 />
               </Field>
 
+              <Field label="Image Hint (optional)">
+                <div className="space-y-2">
+                  {(draft.imageUrl || draft.imageFile) && (
+                    <div className="relative">
+                      <img
+                        src={draft.imageFile ? URL.createObjectURL(draft.imageFile) : draft.imageUrl}
+                        alt="Preview"
+                        className="w-full max-w-xs rounded-lg"
+                      />
+                      <button
+                        onClick={() => {
+                          setDraft.setImageUrl(undefined)
+                          setDraft.setImageFile(null)
+                        }}
+                        className="absolute top-2 right-2 rounded-lg bg-rose-500 px-2 py-1 text-xs font-semibold text-white hover:bg-rose-600"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  )}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0]
+                      if (file) {
+                        setDraft.setImageFile(file)
+                      }
+                    }}
+                    className="w-full text-sm text-slate-400 file:mr-4 file:rounded-lg file:border-0 file:bg-slate-800 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-slate-200 hover:file:bg-slate-700"
+                  />
+                  <div className="text-xs text-slate-400">
+                    Max 5MB. JPG, PNG, GIF, or WebP
+                  </div>
+                </div>
+              </Field>
+
               <div className="flex gap-2">
                 <button
                   onClick={onSave}
@@ -1455,7 +1856,14 @@ function WordsTab(props: {
                         onClick={() => onBeginEdit(w)}
                       >
                         <td className="px-3 py-2">
-                          <div className="font-semibold text-slate-100">{w.word}</div>
+                          <div className="flex items-center gap-2">
+                            <div className="font-semibold text-slate-100">{w.word}</div>
+                            {w.imageUrl && (
+                              <svg className="h-3.5 w-3.5 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                              </svg>
+                            )}
+                          </div>
                           <div className="text-xs text-slate-400 line-clamp-1">{w.hint || '—'}</div>
                         </td>
                         <td className="px-3 py-2">
@@ -2138,6 +2546,7 @@ function normalizeWord(w: WordItem, cfg: AppConfig): WordItem {
     word: String(w.word || '').trim(),
     hint: String(w.hint || '').trim(),
     definition: String(w.definition || '').trim(),
+    imageUrl: w.imageUrl,
     createdAt: w.createdAt || nowIso,
     updatedAt: w.updatedAt || nowIso,
 

@@ -307,6 +307,7 @@ export default function VersusMode(props: {
         word: w.word,
         hint: w.hint,
         definition: w.definition,
+        imageUrl: w.imageUrl,
       }))
 
       // Player B gets Player A's words to read
@@ -315,6 +316,7 @@ export default function VersusMode(props: {
         word: w.word,
         hint: w.hint,
         definition: w.definition,
+        imageUrl: w.imageUrl,
       }))
 
       await startVersusGame(roomData.id, wordsForA, wordsForB)
@@ -746,6 +748,19 @@ export default function VersusMode(props: {
                     <div className="text-sm text-slate-400 mb-2">Hint</div>
                     <div className="text-slate-200">{currentWord?.hint || '—'}</div>
                   </div>
+
+                  {currentWord?.imageUrl && (
+                    <div className="rounded-xl bg-slate-950/40 p-4">
+                      <div className="text-sm text-slate-400 mb-2">Image Hint</div>
+                      <div>
+                        <img
+                          src={currentWord.imageUrl}
+                          alt="Word hint"
+                          className="w-full max-w-md rounded-lg"
+                        />
+                      </div>
+                    </div>
+                  )}
 
                   <div className="rounded-xl bg-slate-950/40 p-4">
                     <div className="text-sm text-slate-400 mb-2">Definition</div>
