@@ -9,6 +9,7 @@ import {
   updateVersusRoom,
   startVersusGame,
   subscribeToVersusRoom,
+  deleteVersusRoom,
   type VersusRoom,
   type VersusWord,
 } from '../lib/versus-operations'
@@ -70,7 +71,12 @@ export default function VersusMode(props: {
         if (roomData && roomData.status !== 'finished') {
           // Verify user is part of this room
           if (roomData.playerAId === currentUserId || roomData.playerBId === currentUserId) {
-            console.log('Rejoined room successfully:', roomData.roomCode, 'status:', roomData.status)
+            console.log('Rejoined room successfully:', {
+              roomCode: roomData.roomCode,
+              status: roomData.status,
+              playerAName: roomData.playerAName,
+              playerBName: roomData.playerBName,
+            })
             setRoom(roomData)
 
             if (roomData.status === 'waiting') {
@@ -136,16 +142,33 @@ export default function VersusMode(props: {
         currentTurn: updatedRoom.currentTurn,
         playerAIndex: updatedRoom.playerAIndex,
         playerBIndex: updatedRoom.playerBIndex,
+        hasPlayerAName: !!updatedRoom.playerAName,
+        hasPlayerBName: !!updatedRoom.playerBName,
       })
 
       setRoom(updatedRoom)
 
+      // If player B just joined and we don't have their name, fetch it
+      if (updatedRoom.playerBId && !updatedRoom.playerBName && room.playerBId !== updatedRoom.playerBId) {
+        console.log('Player B joined, fetching updated room data with names')
+        getVersusRoom(updatedRoom.id).then((freshRoom) => {
+          if (freshRoom) {
+            // Merge fresh data (with names) into current room state
+            setRoom((current) => ({
+              ...current!,
+              playerAName: freshRoom.playerAName,
+              playerBName: freshRoom.playerBName,
+            }))
+          }
+        }).catch(console.error)
+      }
+
       // Update state based on room status
-      if (updatedRoom.status === 'active' && state === 'waiting') {
+      if (updatedRoom.status === 'active' && (state === 'waiting' || state === 'finished')) {
+        // Game starting or restarting
         setState('playing')
       } else if (updatedRoom.status === 'finished') {
-        // Clear saved room when game finishes
-        localStorage.removeItem(ROOM_STORAGE_KEY)
+        // Don't clear saved room - allow play again
         if (state === 'playing') {
           setState('finished')
         }
@@ -169,6 +192,12 @@ export default function VersusMode(props: {
       const roomData = await getVersusRoom(roomId)
 
       if (roomData) {
+        console.log('Room created with data:', {
+          playerAName: roomData.playerAName,
+          playerBName: roomData.playerBName,
+          playerAId: roomData.playerAId,
+          playerBId: roomData.playerBId,
+        })
         setRoom(roomData)
         setState('waiting')
         // Save room ID to localStorage for rejoin capability
@@ -195,6 +224,12 @@ export default function VersusMode(props: {
       const roomData = await getVersusRoom(roomId)
 
       if (roomData) {
+        console.log('Joined room with data:', {
+          playerAName: roomData.playerAName,
+          playerBName: roomData.playerBName,
+          playerAId: roomData.playerAId,
+          playerBId: roomData.playerBId,
+        })
         setRoom(roomData)
         // Save room ID to localStorage for rejoin capability
         localStorage.setItem(ROOM_STORAGE_KEY, roomId)
@@ -368,8 +403,21 @@ export default function VersusMode(props: {
     const otherPlayerTotal = playerAFinished ? room.playerBWords.length : room.playerAWords.length
 
     if (otherPlayerIndex >= otherPlayerTotal) {
-      // Both finished - compare times
-      const winnerId = room.playerATime < room.playerBTime ? room.playerAId : room.playerBId!
+      // Both finished - compare RIGHT ANSWER COUNTS (not times!)
+      // Player A reads to Player B, so Player B's right count is their score
+      // Player B reads to Player A, so Player A's right count is their score
+      const playerAScore = room.playerARightCount
+      const playerBScore = room.playerBRightCount
+
+      let winnerId: string
+      if (playerAScore > playerBScore) {
+        winnerId = room.playerAId
+      } else if (playerBScore > playerAScore) {
+        winnerId = room.playerBId!
+      } else {
+        // Tie - use time as tiebreaker
+        winnerId = room.playerATime < room.playerBTime ? room.playerAId : room.playerBId!
+      }
 
       // Play winner revealed sound
       soundPlayer.play('winnerRevealed')
@@ -392,8 +440,20 @@ export default function VersusMode(props: {
           turnStartTime: new Date().toISOString(),
         })
       } else {
-        // Current player wins
-        const winnerId = playerAFinished ? room.playerAId : room.playerBId!
+        // Current player finished first, but other player still has a chance
+        // Compare scores
+        const playerAScore = room.playerARightCount
+        const playerBScore = room.playerBRightCount
+
+        let winnerId: string
+        if (playerAScore > playerBScore) {
+          winnerId = room.playerAId
+        } else if (playerBScore > playerAScore) {
+          winnerId = room.playerBId!
+        } else {
+          // Tie - player who finished wins
+          winnerId = playerAFinished ? room.playerAId : room.playerBId!
+        }
 
         // Play winner revealed sound
         soundPlayer.play('winnerRevealed')
@@ -404,6 +464,22 @@ export default function VersusMode(props: {
           currentTurn: null,
         })
       }
+    }
+  }
+
+  async function handlePlayAgain() {
+    if (!room) return
+
+    try {
+      setError(null)
+      setState('joining') // Show loading state
+
+      // Reinitialize game with new words
+      await initializeGame(room)
+    } catch (err: any) {
+      console.error('Failed to restart game:', err)
+      setError(err.message || 'Failed to restart game')
+      setState('finished')
     }
   }
 
@@ -423,6 +499,23 @@ export default function VersusMode(props: {
       // Exit anyway
       handleExit()
     }
+  }
+
+  async function handleExitAndDeleteRoom() {
+    if (!room) {
+      onExit()
+      return
+    }
+
+    try {
+      // Delete the room from database
+      await deleteVersusRoom(room.id)
+    } catch (err) {
+      console.error('Failed to delete room:', err)
+      // Continue with exit even if deletion fails
+    }
+
+    handleExit()
   }
 
   function handleExit() {
@@ -488,7 +581,7 @@ export default function VersusMode(props: {
           </div>
 
           <button
-            onClick={handleExit}
+            onClick={handleExitAndDeleteRoom}
             className="mt-6 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
           >
             Back
@@ -694,6 +787,14 @@ export default function VersusMode(props: {
     )
   }
 
+  if (state === 'joining') {
+    return (
+      <div className="min-h-[60vh] flex items-center justify-center">
+        <div className="text-lg text-slate-300">Starting new game...</div>
+      </div>
+    )
+  }
+
   if (state === 'finished' && room) {
     const isPlayerA = currentUserId === room.playerAId
     const isWinner = room.winnerId === currentUserId
@@ -750,12 +851,20 @@ export default function VersusMode(props: {
             </div>
           </div>
 
-          <button
-            onClick={handleExit}
-            className="w-full rounded-xl bg-slate-100 px-6 py-4 text-lg font-semibold text-slate-950 hover:bg-white"
-          >
-            Back to Menu
-          </button>
+          <div className="flex gap-4">
+            <button
+              onClick={handlePlayAgain}
+              className="flex-1 rounded-xl bg-emerald-400 px-6 py-4 text-lg font-semibold text-slate-950 hover:bg-emerald-300"
+            >
+              Play Again
+            </button>
+            <button
+              onClick={handleLeaveGame}
+              className="flex-1 rounded-xl border border-slate-700 bg-slate-950 px-6 py-4 text-lg font-semibold text-slate-200 hover:bg-slate-900"
+            >
+              Leave Game
+            </button>
+          </div>
         </div>
       </div>
     )

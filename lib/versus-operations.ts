@@ -140,10 +140,29 @@ export async function startVersusGame(
       status: 'active',
       player_a_words: playerAWords,
       player_b_words: playerBWords,
+      player_a_index: 0,
+      player_b_index: 0,
+      player_a_wrong_count: 0,
+      player_b_wrong_count: 0,
+      player_a_right_count: 0,
+      player_b_right_count: 0,
+      player_a_time: 0,
+      player_b_time: 0,
+      winner_id: null,
       current_turn: (await getVersusRoom(roomId))?.playerAId, // Player A starts
       turn_start_time: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })
+    .eq('id', roomId)
+
+  if (error) throw error
+}
+
+// Delete a versus room
+export async function deleteVersusRoom(roomId: string): Promise<void> {
+  const { error } = await (supabase as any)
+    .from('vocab_versus_rooms')
+    .delete()
     .eq('id', roomId)
 
   if (error) throw error
