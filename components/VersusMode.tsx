@@ -377,6 +377,24 @@ export default function VersusMode(props: {
     }
   }
 
+  async function handleLeaveGame() {
+    if (!room) return
+
+    try {
+      // End the game for everyone
+      await updateVersusRoom(room.id, {
+        status: 'finished',
+        winnerId: null, // No winner when someone leaves
+      })
+
+      handleExit()
+    } catch (err) {
+      console.error('Failed to leave game:', err)
+      // Exit anyway
+      handleExit()
+    }
+  }
+
   function handleExit() {
     if (channelRef.current) {
       channelRef.current.unsubscribe()
@@ -464,14 +482,22 @@ export default function VersusMode(props: {
             <div className="text-5xl font-mono font-bold tracking-wider">{room.roomCode}</div>
           </div>
 
-          <p className="text-slate-300">Share this code with your opponent</p>
+          <p className="text-slate-300 mb-4">Share this code with your opponent</p>
 
-          <button
-            onClick={handleExit}
-            className="mt-6 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
-          >
-            Cancel
-          </button>
+          <div className="space-y-2">
+            <button
+              onClick={handleLeaveGame}
+              className="w-full rounded-xl border border-rose-700 bg-rose-950/20 px-4 py-2 text-sm font-semibold text-rose-200 hover:bg-rose-900/30"
+            >
+              Cancel & End Room
+            </button>
+            <button
+              onClick={handleExit}
+              className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900"
+            >
+              Back (Keep Room Open)
+            </button>
+          </div>
         </div>
       </div>
     )
@@ -502,10 +528,19 @@ export default function VersusMode(props: {
       <div className="max-w-4xl mx-auto">
         <div className="grid gap-4">
           {/* Room Code Header */}
-          <div className="text-center">
+          <div className="flex items-center justify-between">
+            <div className="flex-1"></div>
             <div className="inline-block rounded-xl bg-slate-950/40 border border-slate-700 px-4 py-2">
               <span className="text-xs text-slate-400 mr-2">Room Code:</span>
               <span className="text-lg font-mono font-bold tracking-wider">{room.roomCode}</span>
+            </div>
+            <div className="flex-1 flex justify-end">
+              <button
+                onClick={handleLeaveGame}
+                className="rounded-xl border border-rose-700 bg-rose-950/20 px-4 py-2 text-sm font-semibold text-rose-200 hover:bg-rose-900/30"
+              >
+                Leave Game
+              </button>
             </div>
           </div>
 
@@ -588,13 +623,18 @@ export default function VersusMode(props: {
   if (state === 'finished' && room) {
     const isPlayerA = currentUserId === room.playerAId
     const isWinner = room.winnerId === currentUserId
+    const gameAbandoned = room.winnerId === null
 
     return (
       <div className="min-h-[60vh] flex items-center justify-center">
         <div className="max-w-2xl w-full rounded-2xl border border-slate-800 bg-slate-900/30 p-8">
-          <h2 className={`text-3xl font-bold text-center mb-8 ${isWinner ? 'text-emerald-400' : 'text-rose-400'}`}>
-            {isWinner ? '🏆 You Win!' : 'You Lost'}
+          <h2 className={`text-3xl font-bold text-center mb-8 ${gameAbandoned ? 'text-slate-400' : isWinner ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {gameAbandoned ? 'Game Ended' : isWinner ? '🏆 You Win!' : 'You Lost'}
           </h2>
+
+          {gameAbandoned && (
+            <p className="text-center text-slate-300 mb-6">A player left the game</p>
+          )}
 
           <div className="grid grid-cols-2 gap-6 mb-8">
             <div className="rounded-xl bg-slate-950/40 p-6">
