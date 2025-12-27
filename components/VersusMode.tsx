@@ -33,7 +33,25 @@ export default function VersusMode(props: {
   const [isRejoining, setIsRejoining] = useState(false)
 
   const channelRef = useRef<RealtimeChannel | null>(null)
-  const turnTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const [displayTime, setDisplayTime] = useState(Date.now())
+
+  // Update display time every second for live timer display
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setDisplayTime(Date.now())
+    }, 1000)
+
+    return () => clearInterval(interval)
+  }, [])
+
+  // Helper to calculate current time including elapsed time for active player
+  const getCurrentTime = (playerTime: number, isCurrentTurn: boolean) => {
+    if (!room || !isCurrentTurn || !room.turnStartTime) {
+      return playerTime
+    }
+    const elapsed = displayTime - new Date(room.turnStartTime).getTime()
+    return playerTime + Math.max(0, elapsed)
+  }
 
   // Attempt to rejoin room on mount
   useEffect(() => {
@@ -88,9 +106,6 @@ export default function VersusMode(props: {
       if (channelRef.current) {
         channelRef.current.unsubscribe()
       }
-      if (turnTimerRef.current) {
-        clearInterval(turnTimerRef.current)
-      }
     }
   }, [])
 
@@ -130,38 +145,6 @@ export default function VersusMode(props: {
       channelRef.current = null
     }
   }, [room?.id, state, room?.playerAWords, room?.playerBWords])
-
-  // Timer for current turn
-  useEffect(() => {
-    if (state !== 'playing' || !room || !room.currentTurn || !room.turnStartTime) return
-
-    if (turnTimerRef.current) {
-      clearInterval(turnTimerRef.current)
-    }
-
-    turnTimerRef.current = setInterval(() => {
-      if (!room.turnStartTime) return
-
-      const elapsed = Date.now() - new Date(room.turnStartTime).getTime()
-      const isPlayerA = currentUserId === room.playerAId
-
-      if (room.currentTurn === currentUserId) {
-        // Current player's timer
-        const newTime = isPlayerA ? room.playerATime + 1000 : room.playerBTime + 1000
-
-        updateVersusRoom(room.id, {
-          ...(isPlayerA ? { playerATime: newTime } : { playerBTime: newTime }),
-        }).catch(console.error)
-      }
-    }, 1000)
-
-    return () => {
-      if (turnTimerRef.current) {
-        clearInterval(turnTimerRef.current)
-        turnTimerRef.current = null
-      }
-    }
-  }, [state, room?.currentTurn, currentUserId])
 
   async function handleCreateRoom() {
     try {
@@ -229,36 +212,48 @@ export default function VersusMode(props: {
         getAllWordsWithProgress(roomData.playerBId!),
       ])
 
-      // Pick 10 random due words (words with dueAt <= now)
-      const now = new Date()
-      let playerADue = playerAWords.filter((w) => new Date(w.dueAt) <= now)
-      let playerBDue = playerBWords.filter((w) => new Date(w.dueAt) <= now)
+      // Helper function to select words with priority for attempted words
+      const selectWords = (allWords: typeof playerAWords, count: number) => {
+        // Separate attempted words (those that have been reviewed) from unattempted
+        const attempted = allWords.filter(
+          (w) => w.lastReviewedAt || w.totalRight > 0 || w.totalWrong > 0
+        )
+        const unattempted = allWords.filter(
+          (w) => !w.lastReviewedAt && w.totalRight === 0 && w.totalWrong === 0
+        )
 
-      // Fallback: if not enough due words, use all words
-      if (playerADue.length < 3) {
-        playerADue = playerAWords
-      }
-      if (playerBDue.length < 3) {
-        playerBDue = playerBWords
+        // Shuffle both pools
+        const shuffledAttempted = [...attempted].sort(() => Math.random() - 0.5)
+        const shuffledUnattempted = [...unattempted].sort(() => Math.random() - 0.5)
+
+        // Take from attempted first, then unattempted if needed
+        const selected = [
+          ...shuffledAttempted.slice(0, count),
+          ...shuffledUnattempted.slice(0, Math.max(0, count - shuffledAttempted.length)),
+        ]
+
+        // Shuffle final selection to randomize order
+        return selected.sort(() => Math.random() - 0.5).slice(0, count)
       }
 
       // Validate: both players must have at least 1 word
-      if (playerADue.length === 0) {
+      if (playerAWords.length === 0) {
         setError('Player A has no words in their vocabulary. Add some words first!')
         setState('menu')
         return
       }
-      if (playerBDue.length === 0) {
+      if (playerBWords.length === 0) {
         setError('Player B has no words in their vocabulary. Add some words first!')
         setState('menu')
         return
       }
 
-      const shuffleA = [...playerADue].sort(() => Math.random() - 0.5).slice(0, 10)
-      const shuffleB = [...playerBDue].sort(() => Math.random() - 0.5).slice(0, 10)
+      // Select 10 words for each player, prioritizing attempted words
+      const selectedA = selectWords(playerAWords, 10)
+      const selectedB = selectWords(playerBWords, 10)
 
       // Player A gets Player B's words to read
-      const wordsForA: VersusWord[] = shuffleB.map((w) => ({
+      const wordsForA: VersusWord[] = selectedB.map((w) => ({
         id: w.id,
         word: w.word,
         hint: w.hint,
@@ -266,7 +261,7 @@ export default function VersusMode(props: {
       }))
 
       // Player B gets Player A's words to read
-      const wordsForB: VersusWord[] = shuffleA.map((w) => ({
+      const wordsForB: VersusWord[] = selectedA.map((w) => ({
         id: w.id,
         word: w.word,
         hint: w.hint,
@@ -295,27 +290,49 @@ export default function VersusMode(props: {
     const newIndex = currentIndex + 1
 
     if (correct) {
-      // Correct answer - stay on current turn
-      const newRightCount = isPlayerA ? room.playerARightCount + 1 : room.playerBRightCount + 1
+      // Correct answer - OPPONENT gets the point (they answered correctly)
+      // Player A reads to Player B, so if correct, Player B gets the point
+      const newRightCount = isPlayerA ? room.playerBRightCount + 1 : room.playerARightCount + 1
 
       if (newIndex >= totalWords) {
-        // Player finished all words!
+        // Player finished all words! Calculate final time
+        const turnElapsed = room.turnStartTime
+          ? Date.now() - new Date(room.turnStartTime).getTime()
+          : 0
+        const newTime = isPlayerA ? room.playerATime + turnElapsed : room.playerBTime + turnElapsed
+
+        await updateVersusRoom(room.id, {
+          ...(isPlayerA
+            ? { playerAIndex: newIndex, playerBRightCount: newRightCount, playerATime: newTime }
+            : { playerBIndex: newIndex, playerARightCount: newRightCount, playerBTime: newTime }),
+        })
         await finishGame(isPlayerA)
       } else {
         // Continue with next word
         await updateVersusRoom(room.id, {
           ...(isPlayerA
-            ? { playerAIndex: newIndex, playerARightCount: newRightCount }
-            : { playerBIndex: newIndex, playerBRightCount: newRightCount }),
+            ? { playerAIndex: newIndex, playerBRightCount: newRightCount }
+            : { playerBIndex: newIndex, playerARightCount: newRightCount }),
         })
       }
     } else {
-      // Wrong answer - increment index AND switch turns
-      const newWrongCount = isPlayerA ? room.playerAWrongCount + 1 : room.playerBWrongCount + 1
+      // Wrong answer - OPPONENT gets wrong count (they answered wrong)
+      const newWrongCount = isPlayerA ? room.playerBWrongCount + 1 : room.playerAWrongCount + 1
       const nextTurn = isPlayerA ? room.playerBId! : room.playerAId
+
+      // Calculate elapsed time for current turn and add to total
+      const turnElapsed = room.turnStartTime
+        ? Date.now() - new Date(room.turnStartTime).getTime()
+        : 0
+      const newTime = isPlayerA ? room.playerATime + turnElapsed : room.playerBTime + turnElapsed
 
       if (newIndex >= totalWords) {
         // Player finished all words (but got last one wrong)
+        await updateVersusRoom(room.id, {
+          ...(isPlayerA
+            ? { playerAIndex: newIndex, playerBWrongCount: newWrongCount, playerATime: newTime }
+            : { playerBIndex: newIndex, playerAWrongCount: newWrongCount, playerBTime: newTime }),
+        })
         await finishGame(isPlayerA)
       } else {
         // Move to next word and switch turns
@@ -323,8 +340,8 @@ export default function VersusMode(props: {
           currentTurn: nextTurn,
           turnStartTime: new Date().toISOString(),
           ...(isPlayerA
-            ? { playerAIndex: newIndex, playerAWrongCount: newWrongCount }
-            : { playerBIndex: newIndex, playerBWrongCount: newWrongCount }),
+            ? { playerAIndex: newIndex, playerBWrongCount: newWrongCount, playerATime: newTime }
+            : { playerBIndex: newIndex, playerAWrongCount: newWrongCount, playerBTime: newTime }),
         })
       }
     }
@@ -359,7 +376,6 @@ export default function VersusMode(props: {
         await updateVersusRoom(room.id, {
           currentTurn: nextTurn,
           turnStartTime: new Date().toISOString(),
-          ...(playerAFinished ? { playerAIndex: room.playerAWords.length } : { playerBIndex: room.playerBWords.length }),
         })
       } else {
         // Current player wins
@@ -398,9 +414,6 @@ export default function VersusMode(props: {
   function handleExit() {
     if (channelRef.current) {
       channelRef.current.unsubscribe()
-    }
-    if (turnTimerRef.current) {
-      clearInterval(turnTimerRef.current)
     }
     // Clear saved room from localStorage
     localStorage.removeItem(ROOM_STORAGE_KEY)
@@ -554,7 +567,7 @@ export default function VersusMode(props: {
                   Progress: {myIndex} / {myWords.length}
                 </div>
                 <div className="text-sm text-slate-300">
-                  Time: {formatTime(isPlayerA ? room.playerATime : room.playerBTime)}
+                  Time: {formatTime(getCurrentTime(isPlayerA ? room.playerATime : room.playerBTime, isMyTurn))}
                 </div>
               </div>
 
@@ -566,7 +579,7 @@ export default function VersusMode(props: {
                   {isPlayerA ? room.playerBWords.length : room.playerAWords.length}
                 </div>
                 <div className="text-sm text-slate-300">
-                  Time: {formatTime(isPlayerA ? room.playerBTime : room.playerATime)}
+                  Time: {formatTime(getCurrentTime(isPlayerA ? room.playerBTime : room.playerATime, !isMyTurn))}
                 </div>
               </div>
             </div>
@@ -578,12 +591,48 @@ export default function VersusMode(props: {
               <div>
                 <div className="text-center mb-6">
                   <div className="text-sm text-emerald-400 mb-2">YOUR TURN - Read this word:</div>
-                  <div className="text-5xl font-bold">{currentWord?.word || 'Loading...'}</div>
+                  <div className="flex items-center justify-center gap-3">
+                    <div className="text-5xl font-bold">{currentWord?.word || 'Loading...'}</div>
+                    {currentWord && (
+                      <button
+                        onClick={() => {
+                          const utterance = new SpeechSynthesisUtterance(currentWord.word)
+                          utterance.lang = 'en-US'
+                          utterance.rate = 0.9
+                          window.speechSynthesis.speak(utterance)
+                        }}
+                        className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-slate-200 hover:bg-slate-900"
+                        title="Pronounce word"
+                      >
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          strokeWidth={1.5}
+                          stroke="currentColor"
+                          className="w-6 h-6"
+                        >
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            d="M19.114 5.636a9 9 0 010 12.728M16.463 8.288a5.25 5.25 0 010 7.424M6.75 8.25l4.72-4.72a.75.75 0 011.28.53v15.88a.75.75 0 01-1.28.53l-4.72-4.72H4.51c-.88 0-1.704-.507-1.938-1.354A9.01 9.01 0 012.25 12c0-.83.112-1.633.322-2.396C2.806 8.756 3.63 8.25 4.51 8.25H6.75z"
+                          />
+                        </svg>
+                      </button>
+                    )}
+                  </div>
                 </div>
 
-                <div className="rounded-xl bg-slate-950/40 p-4 mb-6">
-                  <div className="text-sm text-slate-400 mb-2">Hint</div>
-                  <div className="text-slate-200">{currentWord?.hint || '—'}</div>
+                <div className="space-y-4 mb-6">
+                  <div className="rounded-xl bg-slate-950/40 p-4">
+                    <div className="text-sm text-slate-400 mb-2">Hint</div>
+                    <div className="text-slate-200">{currentWord?.hint || '—'}</div>
+                  </div>
+
+                  <div className="rounded-xl bg-slate-950/40 p-4">
+                    <div className="text-sm text-slate-400 mb-2">Definition</div>
+                    <div className="text-slate-200">{currentWord?.definition || '—'}</div>
+                  </div>
                 </div>
 
                 <div className="text-center text-sm text-slate-400 mb-6">
