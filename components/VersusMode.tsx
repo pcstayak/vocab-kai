@@ -124,6 +124,20 @@ export default function VersusMode(props: {
         updatedRoom.playerBWords = room.playerBWords
       }
 
+      // Preserve player names (realtime doesn't include JOIN data)
+      if (!updatedRoom.playerAName && room.playerAName) {
+        updatedRoom.playerAName = room.playerAName
+      }
+      if (!updatedRoom.playerBName && room.playerBName) {
+        updatedRoom.playerBName = room.playerBName
+      }
+
+      console.log('Room updated via realtime:', {
+        currentTurn: updatedRoom.currentTurn,
+        playerAIndex: updatedRoom.playerAIndex,
+        playerBIndex: updatedRoom.playerBIndex,
+      })
+
       setRoom(updatedRoom)
 
       // Update state based on room status
@@ -144,7 +158,7 @@ export default function VersusMode(props: {
       channel.unsubscribe()
       channelRef.current = null
     }
-  }, [room?.id, state, room?.playerAWords, room?.playerBWords])
+  }, [room?.id, state, room?.playerAWords, room?.playerBWords, room?.playerAName, room?.playerBName])
 
   async function handleCreateRoom() {
     try {
@@ -523,6 +537,17 @@ export default function VersusMode(props: {
     const myIndex = isPlayerA ? room.playerAIndex : room.playerBIndex
     const currentWord = myWords[myIndex]
 
+    // Debug logging for turn state
+    console.log('Playing state:', {
+      currentUserId,
+      roomCurrentTurn: room.currentTurn,
+      isMyTurn,
+      isPlayerA,
+      myIndex,
+      myWordsLength: myWords.length,
+      hasCurrentWord: !!currentWord,
+    })
+
     // Debug logging
     if (!currentWord) {
       console.log('DEBUG: No current word!', {
@@ -573,7 +598,7 @@ export default function VersusMode(props: {
 
               <div className={`rounded-xl p-4 ${!isMyTurn ? 'bg-emerald-950/20 border-2 border-emerald-400' : 'bg-slate-950/40 border border-slate-800'}`}>
                 <div className="text-sm text-slate-400">Opponent</div>
-                <div className="text-xl font-bold">Player {isPlayerA ? 'B' : 'A'}</div>
+                <div className="text-xl font-bold">{isPlayerA ? room.playerBName || 'Player B' : room.playerAName || 'Player A'}</div>
                 <div className="mt-2 text-sm">
                   Progress: {isPlayerA ? room.playerBIndex : room.playerAIndex} /{' '}
                   {isPlayerA ? room.playerBWords.length : room.playerAWords.length}
@@ -656,10 +681,10 @@ export default function VersusMode(props: {
               </div>
             ) : (
               <div className="text-center py-12">
-                <div className="text-lg text-slate-400 mb-4">Opponent's Turn</div>
+                <div className="text-lg text-slate-400 mb-4">{isPlayerA ? room.playerBName || "Opponent" : room.playerAName || "Opponent"}'s Turn</div>
                 <div className="text-3xl font-bold mb-2">Listen and Answer!</div>
                 <div className="text-slate-300">
-                  Your opponent will read you a word. Define it to keep your turn.
+                  {isPlayerA ? room.playerBName || 'Your opponent' : room.playerAName || 'Your opponent'} will read you a word. Define it to keep your turn.
                 </div>
               </div>
             )}
@@ -687,7 +712,7 @@ export default function VersusMode(props: {
 
           <div className="grid grid-cols-2 gap-6 mb-8">
             <div className="rounded-xl bg-slate-950/40 p-6">
-              <div className="text-sm text-slate-400 mb-2">You</div>
+              <div className="text-sm text-slate-400 mb-2">{currentUserName}</div>
               <div className="space-y-2 text-sm">
                 <div>
                   Completed: {isPlayerA ? room.playerAIndex : room.playerBIndex} /{' '}
@@ -706,7 +731,7 @@ export default function VersusMode(props: {
             </div>
 
             <div className="rounded-xl bg-slate-950/40 p-6">
-              <div className="text-sm text-slate-400 mb-2">Opponent</div>
+              <div className="text-sm text-slate-400 mb-2">{isPlayerA ? room.playerBName || 'Opponent' : room.playerAName || 'Opponent'}</div>
               <div className="space-y-2 text-sm">
                 <div>
                   Completed: {isPlayerA ? room.playerBIndex : room.playerAIndex} /{' '}

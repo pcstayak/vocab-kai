@@ -15,6 +15,8 @@ export type VersusRoom = {
   roomCode: string
   playerAId: string
   playerBId: string | null
+  playerAName?: string
+  playerBName?: string
   status: VersusRoomStatus
   currentTurn: string | null
   playerAWords: VersusWord[]
@@ -63,7 +65,11 @@ export async function joinVersusRoom(roomCode: string, userId: string): Promise<
 export async function getVersusRoom(roomId: string): Promise<VersusRoom | null> {
   const { data, error } = await supabase
     .from('vocab_versus_rooms')
-    .select('*')
+    .select(`
+      *,
+      player_a:vocab_users!vocab_versus_rooms_player_a_id_fkey(name),
+      player_b:vocab_users!vocab_versus_rooms_player_b_id_fkey(name)
+    `)
     .eq('id', roomId)
     .single()
 
@@ -227,6 +233,8 @@ function mapRoomFromDb(data: any): VersusRoom {
     roomCode: data.room_code,
     playerAId: data.player_a_id,
     playerBId: data.player_b_id,
+    playerAName: data.player_a?.name,
+    playerBName: data.player_b?.name,
     status: data.status,
     currentTurn: data.current_turn,
     playerAWords,
